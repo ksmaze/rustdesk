@@ -1,0 +1,112 @@
+# =============================================================================
+# Dockerfile.web - Build and serve RustDesk Flutter Web Client
+# =============================================================================
+# Usage:
+#   docker build -f Dockerfile.web -t rustdesk-web .
+#   docker run -p 5000:5000 rustdesk-web
+#
+# Environment variables (runtime):
+#   RUSTDESK_SERVER       - Rendezvous server address, e.g. "myserver.com" or "myserver.com:21116"
+#   RUSTDESK_KEY          - Server public key for verification
+#   RUSTDESK_API_SERVER   - API server URL, e.g. "https://myserver.com:21114"
+#   RUSTDESK_RELAY_SERVER - Relay server address (if different from rendezvous)
+#   RUSTDESK_PORT         - Web server port (default: 5000)
+# =============================================================================
+
+# --- Stage 1: Build the Flutter web application ---
+
+FROM ubuntu:22.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV FLUTTER_VERSION=3.24.5
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        wget \
+        unzip \
+        xz-utils \
+        libgconf-2-4 \
+        libstdc++6 \
+        fonts-droid-fallback \
+        clang \
+        cmake \
+        ninja-build \
+        pkg-config \
+        libgtk-3-dev \
+        python3 \
+        protobuf-compiler \
+        ca-certificates && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Flutter SDK
+RUN git clone --branch ${FLUTTER_VERSION} --depth 1 https://github.com/flutter/flutter.git /usr/local/flutter
+ENV PATH="/usr/local/flutter/bin:/usr/local/flutter/bin/cache/dart-sdk/bin:${PATH}"
+RUN flutter precache --web
+RUN flutter config --enable-web
+RUN flutter doctor -v
+
+# Copy the RustDesk source code
+COPY . /app/rustdesk
+WORKDIR /app/rustdesk
+
+# Apply Flutter patch (dropdown_menu enableFilter fix for 3.24.5)
+RUN cd /usr/local/flutter && \
+    git apply /app/rustdesk/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff || true
+
+# Initialize git submodules (in case they weren't copied)
+RUN cd /app/rustdesk && git submodule update --init --recursive || true
+
+# --- Build the JS/TypeScript bridge ---
+WORKDIR /app/rustdesk/flutter/web/js
+
+# Install Node.js 22.x LTS
+RUN apt-get update && \
+    apt-get remove -y libnode-dev libnode72 nodejs npm || true && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --allow-downgrades nodejs
+
+# Install JS build toolchain
+RUN npm install -g yarn typescript
+RUN yarn install
+
+# Build the JS bridge
+RUN cd /app/rustdesk/flutter/web/js && \
+    python ./gen_js_from_hbb.py > src/gen_js_from_hbb.ts && \
+    echo 'import { use_ws } from "./shim";' | cat - src/gen_js_from_hbb.ts > src/gen_js_from_hbb.tmp && \
+    mv src/gen_js_from_hbb.tmp src/gen_js_from_hbb.ts && \
+    python ./ts_proto.py && \
+    npx tsc && \
+    npx vite build
+
+# --- Download web dependencies ---
+WORKDIR /app/rustdesk/flutter/web
+RUN wget -q https://github.com/rustdesk/doc.rustdesk.com/releases/download/console/web_deps.tar.gz && \
+    tar xzf web_deps.tar.gz && \
+    rm web_deps.tar.gz
+
+# --- Build Flutter web release ---
+WORKDIR /app/rustdesk/flutter
+RUN flutter pub get
+RUN flutter build web --release
+
+
+# --- Stage 2: Serve the web application ---
+
+FROM python:3.11-slim AS runtime
+
+# Copy the built web assets from the build stage
+COPY --from=build /app/rustdesk/flutter/build/web /app/web
+
+# Create the entrypoint script that injects runtime config from env vars
+COPY docker/web/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 5000
+WORKDIR /app
+
+ENTRYPOINT ["/app/entrypoint.sh"]

@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  rustdesk-web-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.web.dev
+    container_name: rustdesk-web-dev
+    volumes:
+      # Mount entire repo for live editing
+      - .:/app/rustdesk
+      # Persist build caches so rebuilds are fast
+      - rustdesk-pub-cache:/root/.pub-cache
+      - rustdesk-flutter-build:/app/rustdesk/flutter/build
+      - rustdesk-node-modules:/app/rustdesk/flutter/web/js/node_modules
+    ports:
+      - "5000:5000"
+    environment:
+      - RUSTDESK_SERVER=${RUSTDESK_SERVER:-}
+      - RUSTDESK_KEY=${RUSTDESK_KEY:-}
+      - RUSTDESK_API_SERVER=${RUSTDESK_API_SERVER:-}
+      - RUSTDESK_RELAY_SERVER=${RUSTDESK_RELAY_SERVER:-}
+    stdin_open: true
+    tty: true
+
+volumes:
+  rustdesk-pub-cache:
+  rustdesk-flutter-build:
+  rustdesk-node-modules:

@@ -674,9 +674,8 @@ class InputModel {
     if (!isInputSourceFlutter) {
       if (isDesktop) {
         return KeyEventResult.handled;
-      } else if (isWeb) {
-        return KeyEventResult.ignored;
       }
+      // On web, fall through — Flutter is the only keyboard event source.
     }
     if (isWindows || isLinux) {
       // Ignore meta keys. Because flutter window will loose focus if meta key is pressed.
