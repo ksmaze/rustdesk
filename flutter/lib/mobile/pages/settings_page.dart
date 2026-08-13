@@ -17,6 +17,7 @@ import '../../common/widgets/login.dart';
 import '../../consts.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
+import '../widgets/deploy_dialog.dart';
 import '../widgets/dialog.dart';
 import 'home_page.dart';
 import 'scan_page.dart';
@@ -617,7 +618,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         onToggle: (bool v) async {
           await mainSetLocalBoolOption(kOptionEnableShowTerminalExtraKeys, v);
           final newValue =
-            mainGetLocalBoolOptionSync(kOptionEnableShowTerminalExtraKeys);
+              mainGetLocalBoolOptionSync(kOptionEnableShowTerminalExtraKeys);
           setState(() {
             _showTerminalExtraKeys = newValue;
           });
@@ -688,8 +689,18 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               SettingsTile(
                 title: Obx(() => Text(gFFI.userModel.userName.value.isEmpty
                     ? translate('Login')
-                    : '${translate('Logout')} (${gFFI.userModel.userName.value})')),
-                leading: Icon(Icons.person),
+                    : '${translate('Logout')} (${gFFI.userModel.accountLabelWithHandle})')),
+                leading: Obx(() {
+                  final avatar = bind.mainResolveAvatarUrl(
+                      avatar: gFFI.userModel.avatar.value);
+                  return buildAvatarWidget(
+                        avatar: avatar,
+                        size: 28,
+                        borderRadius: null,
+                        fallback: Icon(Icons.person),
+                      ) ??
+                      Icon(Icons.person);
+                }),
                 onPressed: (context) {
                   if (gFFI.userModel.userName.value.isEmpty) {
                     loginDialog();
@@ -717,6 +728,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 leading: Icon(Icons.network_ping),
                 onPressed: (context) {
                   changeSocks5Proxy();
+                }),
+          if (isAndroid && !bind.isOutgoingOnly())
+            SettingsTile(
+                title: Text(translate('Deploy')),
+                leading: Icon(Icons.cloud_upload),
+                onPressed: (context) {
+                  showDeployDialog();
                 }),
           if (!disabledSettings && !_hideNetwork && !_hideWebSocket)
             SettingsTile.switchTile(
@@ -829,10 +847,12 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             ),
           if (!incomingOnly)
             SettingsTile.switchTile(
-              title: Text(translate('keep-awake-during-outgoing-sessions-label')),
+              title:
+                  Text(translate('keep-awake-during-outgoing-sessions-label')),
               initialValue: _preventSleepWhileConnected,
               onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionKeepAwakeDuringOutgoingSessions, v);
+                await mainSetLocalBoolOption(
+                    kOptionKeepAwakeDuringOutgoingSessions, v);
                 setState(() {
                   _preventSleepWhileConnected = v;
                 });
