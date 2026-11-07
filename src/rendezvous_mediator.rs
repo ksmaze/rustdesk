@@ -1400,80 +1400,6 @@ fn get_direct_port() -> i32 {
     port
 }
 
-/// Browsers can only open WebSockets, so the direct port also takes a WebSocket upgrade and
-/// bridges it onto the same framed stream raw TCP controllers get. A raw controller always
-/// writes first, and its 4-byte length header can never read "GET " (that would be a ~136 MB
-/// frame), so peeking at the first bytes tells the two apart.
-async fn direct_stream(
-    stream: tokio::net::TcpStream,
-    local_addr: SocketAddr,
-) -> ResultType<Stream> {
-    const WS_PREFIX: &[u8; 4] = b"GET ";
-    let mut head = [0u8; 4];
-    let peeked = hbb_common::timeout(CONNECT_TIMEOUT, async {
-        loop {
-            let n = stream.peek(&mut head).await?;
-            if n == 0 {
-                bail!("closed before sending anything");
-            }
-            if n >= head.len() || !WS_PREFIX.starts_with(&head[..n]) {
-                return Ok::<_, anyhow::Error>(n);
-            }
-            sleep(0.01).await;
-        }
-    })
-    .await??;
-    if peeked < head.len() || &head != WS_PREFIX {
-        return Ok(Stream::from(stream, local_addr));
-    }
-    let ws =
-        hbb_common::timeout(CONNECT_TIMEOUT, tokio_tungstenite::accept_async(stream)).await??;
-    let (ours, theirs) = tokio::io::duplex(1 << 20);
-    tokio::spawn(bridge_ws(
-        ws,
-        hbb_common::tokio_util::codec::Framed::new(
-            theirs,
-            hbb_common::bytes_codec::BytesCodec::new(),
-        ),
-    ));
-    Ok(Stream::Tcp(hbb_common::tcp::FramedStream::from(
-        ours, local_addr,
-    )))
-}
-
-async fn bridge_ws(
-    mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    mut framed: hbb_common::tokio_util::codec::Framed<
-        tokio::io::DuplexStream,
-        hbb_common::bytes_codec::BytesCodec,
-    >,
-) {
-    use hbb_common::futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
-    loop {
-        select! {
-            msg = ws.next() => match msg {
-                Some(Ok(WsMessage::Binary(bytes))) => {
-                    if framed.send(bytes).await.is_err() {
-                        break;
-                    }
-                }
-                Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_))) => {}
-                _ => break,
-            },
-            bytes = framed.next() => match bytes {
-                Some(Ok(bytes)) => {
-                    if ws.send(WsMessage::Binary(bytes.freeze())).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
-            },
-        }
-    }
-    ws.close(None).await.ok();
-}
-
 async fn direct_server(server: ServerPtr) {
     let mut listener = None;
     let mut port = 0;
@@ -1522,17 +1448,10 @@ async fn direct_server(server: ServerPtr) {
                     .unwrap_or(Config::get_any_listen_addr(true));
                 let server = server.clone();
                 tokio::spawn(async move {
-                    let stream = match direct_stream(stream, local_addr).await {
-                        Ok(stream) => stream,
-                        Err(err) => {
-                            log::warn!("direct access from {} failed: {}", addr, err);
-                            return;
-                        }
-                    };
                     allow_err!(
                         crate::server::create_tcp_connection(
                             server,
-                            stream,
+                            hbb_common::Stream::from(stream, local_addr),
                             addr,
                             false,
                             ConnectionMeta::default(), // Direct connections don't have server-side user context.
