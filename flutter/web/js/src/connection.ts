@@ -1,4 +1,5 @@
 import Websock from "./websock";
+import WebRTCSock, { isWebrtcEnabled } from "./webrtcsock";
 import * as message from "./message.js";
 import * as rendezvous from "./rendezvous.js";
 import { loadVp9 } from "./codec";
@@ -15,6 +16,8 @@ const HOSTS = [
 ];
 let HOST = localStorage.getItem("rendezvous-server") || HOSTS[0];
 const SCHEMA = "ws://";
+const WEBRTC_CONNECT_TIMEOUT = 15000;
+const RELAY_FALLBACK_DELAY = 2500;
 
 type MsgboxCallback = (type: string, title: string, text: string, link: string) => void;
 type DrawCallback = (display: number, data: Uint8Array) => void;
@@ -152,7 +155,8 @@ function applyLockModes(events: message.KeyEvent[], lockModes: number, isNumpad:
 
 export default class Connection {
   _msgs: any[];
-  _ws: Websock | undefined;
+  _ws: Websock | WebRTCSock | undefined;
+  _rendezvous: Websock | undefined;
   _interval: any;
   _id: string;
   _hash: message.Hash | undefined;
@@ -165,6 +169,10 @@ export default class Connection {
   _options: any;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
+  _qualityTimer: any;
+  _qualityTick: number;
+  _frameCounts: Map<number, number>;
+  _codecFormat: string;
 
   constructor() {
     this._msgbox = globals.msgbox;
@@ -173,6 +181,9 @@ export default class Connection {
     this._id = "";
     this._videoTestSpeed = [0, 0];
     this._cursors = new Map();
+    this._qualityTick = 0;
+    this._frameCounts = new Map();
+    this._codecFormat = "";
   }
 
   async start(id: string) {
@@ -208,6 +219,14 @@ export default class Connection {
       }
     }, 1);
     this.loadVideoDecoder();
+    if (isDirectAddress(id)) {
+      this.msgbox(
+        "error",
+        "Error",
+        "Connecting by IP address is not supported in the web client, please use the ID"
+      );
+      return;
+    }
     const uri = getDefaultUri();
     const ws = new Websock(uri, true);
     this._ws = ws;
@@ -219,16 +238,41 @@ export default class Connection {
     console.log(new Date() + ": Connected to rendezvous server");
     const conn_type = rendezvous.ConnType.DEFAULT_CONN;
     const nat_type = rendezvous.NatType.SYMMETRIC;
+    let rtc: WebRTCSock | undefined;
+    let webrtc_sdp_offer: string | undefined;
+    if (isWebrtcEnabled()) {
+      try {
+        rtc = new WebRTCSock();
+        webrtc_sdp_offer = await rtc.createOffer();
+      } catch (e) {
+        console.warn("WebRTC offer failed: ", e);
+        rtc?.close();
+        rtc = undefined;
+      }
+    }
     const punch_hole_request = rendezvous.PunchHoleRequest.fromPartial({
       id,
       licence_key: localStorage.getItem("key") || undefined,
       conn_type,
       nat_type,
       token: localStorage.getItem("access_token") || undefined,
+      webrtc_sdp_offer,
     });
     ws.sendRendezvous({ punch_hole_request });
-    const msg = (await ws.next()) as rendezvous.RendezvousMessage;
-    ws.close();
+    let msg: rendezvous.RendezvousMessage;
+    const pendingIce: string[] = [];
+    if (rtc) {
+      this._rendezvous = ws;
+      msg = await this.nextPunchResponse(ws, rtc, pendingIce);
+      if (!msg.relay_response?.webrtc_sdp_answer) {
+        rtc.close();
+        rtc = undefined;
+        ws.close();
+      }
+    } else {
+      msg = (await ws.next()) as rendezvous.RendezvousMessage;
+      ws.close();
+    }
     console.log(new Date() + ": Got relay response");
     const phr = msg.punch_hole_response;
     const rr = msg.relay_response;
@@ -256,9 +300,15 @@ export default class Connection {
     } else if (rr) {
       if (!rr.version) {
         this.msgbox("error", "Error", "Remote version is low, not support web");
+        rtc?.close();
+        this._rendezvous?.close();
         return;
       }
-      await this.connectRelay(rr);
+      if (rtc) {
+        await this.connectWebRTC(rr, rtc, pendingIce);
+      } else {
+        await this.connectRelay(rr);
+      }
     }
   }
 
@@ -286,7 +336,123 @@ export default class Connection {
     await this.msgLoop();
   }
 
-  async secure(pk: Uint8Array | undefined) {
+  // The punch response, with the peer's ICE candidates that arrive before it kept for later.
+  async nextPunchResponse(
+    ws: Websock,
+    rtc: WebRTCSock,
+    pendingIce: string[]
+  ): Promise<rendezvous.RendezvousMessage> {
+    while (true) {
+      const msg = (await ws.next()) as rendezvous.RendezvousMessage;
+      const ice = msg.ice_candidate;
+      if (!ice) return msg;
+      if (ice.session_key == rtc.sessionKey && ice.candidate) {
+        pendingIce.push(ice.candidate);
+      }
+    }
+  }
+
+  // Trickle ICE candidates through the rendezvous connection until it is closed.
+  async bridgeIce(ws: Websock, rtc: WebRTCSock) {
+    rtc.onLocalCandidate((candidate) => {
+      const ice_candidate = rendezvous.IceCandidate.fromPartial({
+        id: this._id,
+        session_key: rtc.sessionKey,
+        candidate,
+      });
+      ws.sendRendezvous({ ice_candidate });
+      // The hop from the rendezvous server to the peer may be UDP, so send each one twice.
+      setTimeout(() => ws.sendRendezvous({ ice_candidate }), 400);
+    });
+    while (true) {
+      let msg: rendezvous.RendezvousMessage;
+      try {
+        msg = (await ws.next(1000)) as rendezvous.RendezvousMessage;
+      } catch (e) {
+        if (e === "Timeout") continue;
+        return;
+      }
+      const ice = msg.ice_candidate;
+      if (ice && ice.session_key == rtc.sessionKey && ice.candidate) {
+        rtc.addRemoteCandidate(ice.candidate);
+      }
+    }
+  }
+
+  async openRelay(rr: rendezvous.RelayResponse): Promise<Websock | undefined> {
+    let uri = rr.relay_server;
+    if (uri) {
+      uri = getrUriFromRs(uri, true, 2);
+    } else {
+      uri = getDefaultUri(true);
+    }
+    const ws = new Websock(uri, false);
+    try {
+      await ws.open();
+    } catch (e) {
+      console.warn("Failed to connect to relay server: ", e);
+      return undefined;
+    }
+    const request_relay = rendezvous.RequestRelay.fromPartial({
+      licence_key: localStorage.getItem("key") || undefined,
+      uuid: rr.uuid,
+    });
+    ws.sendRendezvous({ request_relay });
+    return ws;
+  }
+
+  // Race WebRTC against the relay, preferring WebRTC for a while once the relay is ready, as the
+  // native client does.
+  async connectWebRTC(
+    rr: rendezvous.RelayResponse,
+    rtc: WebRTCSock,
+    pendingIce: string[]
+  ) {
+    const ws = this._rendezvous!;
+    const relay = this.openRelay(rr);
+    let rtcOpen: Promise<boolean>;
+    try {
+      await rtc.setAnswer(rr.webrtc_sdp_answer);
+      pendingIce.forEach((candidate) => rtc.addRemoteCandidate(candidate));
+      this.bridgeIce(ws, rtc);
+      rtcOpen = rtc.waitOpen(WEBRTC_CONNECT_TIMEOUT).then(
+        () => true,
+        (e) => {
+          console.warn(e);
+          return false;
+        }
+      );
+    } catch (e) {
+      console.warn("Failed to set WebRTC answer: ", e);
+      rtcOpen = Promise.resolve(false);
+    }
+    const useRtc =
+      (await Promise.race([rtcOpen, relay.then(() => false)])) ||
+      ((await relay)
+        ? await Promise.race([rtcOpen, sleep(RELAY_FALLBACK_DELAY).then(() => false)])
+        : await rtcOpen);
+    ws.close();
+    this._rendezvous = undefined;
+    if (!useRtc) {
+      rtc.close();
+      const relayWs = await relay;
+      if (!relayWs) throw new Error("Failed to connect to relay server");
+      this._ws = relayWs;
+      const secure = (await this.secure(rr.pk)) || false;
+      globals.pushEvent("connection_ready", { secure, direct: false });
+      await this.msgLoop();
+      return;
+    }
+    relay.then((relayWs) => relayWs?.close());
+    console.log(new Date() + ": Connected with WebRTC");
+    this._ws = rtc;
+    const secure = (await this.secure(rr.pk, rtc)) || false;
+    const direct = !(await rtc.isRelayed());
+    globals.pushEvent("connection_ready", { secure, direct, stream_type: "WebRTC" });
+    await this.msgLoop();
+  }
+
+  async secure(pk: Uint8Array | undefined, rtc?: WebRTCSock) {
     if (pk) {
       const RS_PK = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
       try {
@@ -318,6 +484,7 @@ export default class Connection {
     const msg = (await this._ws?.next()) as message.Message;
     let signedId: any = msg?.signed_id;
     if (!signedId) {
+      if (rtc) throw new Error("WebRTC handshake received an unexpected message type");
       console.error("Handshake failed: invalid message type");
       const public_key = message.PublicKey.fromPartial({});
       this._ws?.sendMessage({ public_key });
@@ -327,6 +494,7 @@ export default class Connection {
       signedId = await globals.verify(signedId.id, Uint8Array.from(pk!));
     } catch (e) {
       console.error('Failed to verify signed id pk, ', e);
+      if (rtc) throw new Error("WebRTC peer identity could not be verified");
       // fall back to non-secure connection in case pk mismatch
       console.error("pk mismatch, fall back to non-secure");
       const public_key = message.PublicKey.fromPartial({});
@@ -336,6 +504,11 @@ export default class Connection {
     const idpk = rendezvous.IdPk.decode(signedId);
     const id = idpk.id;
     const theirPk = idpk.pk;
+    // The browser bound the DTLS certificate to the answer's fingerprint; the peer must have
+    // signed that same fingerprint, or a rendezvous/relay swapped the SDP.
+    if (rtc && (id != this._id || !idpk.dtls_fingerprint || idpk.dtls_fingerprint != rtc.remoteFingerprint)) {
+      throw new Error("WebRTC DTLS fingerprint not bound to peer identity (possible MITM)");
+    }
     if (id != this._id!) {
       console.error("Handshake failed: sign failure");
       const public_key = message.PublicKey.fromPartial({});
@@ -363,7 +536,35 @@ export default class Connection {
     return true;
   }
 
+  startQualityStatus() {
+    clearInterval(this._qualityTimer);
+    this._qualityTick = new Date().getTime();
+    this._frameCounts.clear();
+    this._ws?.takeBytesReceived();
+    this._qualityTimer = setInterval(() => this.updateQualityStatus(), 1000);
+  }
+
+  updateQualityStatus() {
+    const now = new Date().getTime();
+    const elapsed = Math.max(now - this._qualityTick, 1);
+    this._qualityTick = now;
+    const bytes = this._ws?.takeBytesReceived() || 0;
+    const fps: Record<number, number> = {};
+    this._frameCounts.forEach((n, display) => {
+      fps[display] = Math.round((n * 1000) / elapsed);
+      this._frameCounts.set(display, 0);
+    });
+    globals.pushEvent("update_quality_status", {
+      speed: ((bytes * 1000) / elapsed / 1024).toFixed(2) + "kB/s",
+      fps: JSON.stringify(fps),
+      codec_format: this._codecFormat,
+      // The web client never advertises i444 decoding, so the peer always sends 4:2:0.
+      chroma: this._codecFormat ? "4:2:0" : "",
+    });
+  }
+
   async msgLoop() {
+    this.startQualityStatus();
     while (true) {
       const msg = (await this._ws?.next()) as message.Message;
       if (msg?.hash) {
@@ -375,6 +576,10 @@ export default class Connection {
         const test_delay = msg?.test_delay;
         console.log('test delay: ', test_delay);
         if (!test_delay.from_client) {
+          globals.pushEvent("update_quality_status", {
+            delay: String(test_delay.last_delay),
+            target_bitrate: String(test_delay.target_bitrate),
+          });
           this._ws?.sendMessage({ test_delay });
         }
       } else if (msg?.login_response) {
@@ -554,7 +759,9 @@ export default class Connection {
     this._msgs = [];
     this._cursors.clear();
     clearInterval(this._interval);
+    clearInterval(this._qualityTimer);
     this._ws?.close();
+    this._rendezvous?.close();
     this._videoDecoder?.close();
   }
 
@@ -666,6 +873,9 @@ export default class Connection {
       this.msgbox("", "", "");
       this._firstFrame = true;
     }
+    this._frameCounts.set(vf.display, (this._frameCounts.get(vf.display) || 0) + 1);
+    const codec = getCodecFormat(vf);
+    if (codec) this._codecFormat = codec;
     if (vf.vp9s) {
       const dec = this._videoDecoder;
       var tm = new Date().getTime();
@@ -1211,6 +1421,29 @@ function getrUriFromRs(
   }
   return SCHEMA + uri;
 }
+
+function getCodecFormat(vf: message.VideoFrame): string {
+  if (vf.vp9s) return "VP9";
+  if (vf.vp8s) return "VP8";
+  if (vf.av1s) return "AV1";
+  if (vf.h264s) return "H264";
+  if (vf.h265s) return "H265";
+  return "";
+}
+
+// Same forms the native client dials directly instead of asking the rendezvous server:
+// hbb_common's is_ip_str and is_domain_port_str.
+const IPV4_RE =
+  /^(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(:\d+)?$/;
+const IPV6_RE =
+  /^((([a-fA-F0-9]{1,4}:{1,2})+[a-fA-F0-9]{1,4})|(\[([a-fA-F0-9]{1,4}:{1,2})+[a-fA-F0-9]{1,4}\]:\d+))$/;
+const DOMAIN_PORT_RE =
+  /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z-]{0,61}[a-z]:\d{1,5}$/i;
+
+export function isDirectAddress(id: string): boolean {
+  return IPV4_RE.test(id) || IPV6_RE.test(id) || DOMAIN_PORT_RE.test(id);
+}
+
 
 function hash(datas: (string | Uint8Array)[]): Uint8Array {
   const hasher = new sha256.Hash();
