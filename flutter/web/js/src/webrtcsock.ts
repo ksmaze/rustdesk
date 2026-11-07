@@ -38,7 +38,7 @@ function getFingerprint(sdp: string): string {
 }
 
 export function isWebrtcEnabled(): boolean {
-  return localStorage.getItem("enable-webrtc") != "N";
+  return localStorage.getItem("option:local:enable-webrtc") != "N";
 }
 
 // A peer-to-peer transport to a native peer over a WebRTC data channel, with the same interface

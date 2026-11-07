@@ -552,8 +552,8 @@ export default class Connection {
     const fps: Record<number, number> = {};
     this._frameCounts.forEach((n, display) => {
       fps[display] = Math.round((n * 1000) / elapsed);
+      this._frameCounts.set(display, 0);
     });
-    this._frameCounts.clear();
     globals.pushEvent("update_quality_status", {
       speed: ((bytes * 1000) / elapsed / 1024).toFixed(2) + "kB/s",
       fps: JSON.stringify(fps),
