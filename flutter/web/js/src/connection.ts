@@ -164,7 +164,7 @@ export default class Connection {
   _password: Uint8Array | undefined;
   _options: any;
   _videoTestSpeed: number[];
-  //_cursors: { [name: number]: any };
+  _cursors: Map<string, message.CursorData>;
 
   constructor() {
     this._msgbox = globals.msgbox;
@@ -172,7 +172,7 @@ export default class Connection {
     this._msgs = [];
     this._id = "";
     this._videoTestSpeed = [0, 0];
-    //this._cursors = {};
+    this._cursors = new Map();
   }
 
   async start(id: string) {
@@ -292,7 +292,7 @@ export default class Connection {
       try {
         pk = await globals.verify(pk, localStorage.getItem("key") || RS_PK);
         if (pk) {
-          const idpk = message.IdPk.decode(pk);
+          const idpk = rendezvous.IdPk.decode(pk);
           if (idpk.id == this._id) {
             pk = idpk.pk;
           }
@@ -333,7 +333,7 @@ export default class Connection {
       this._ws?.sendMessage({ public_key });
       return;
     }
-    const idpk = message.IdPk.decode(signedId);
+    const idpk = rendezvous.IdPk.decode(signedId);
     const id = idpk.id;
     const theirPk = idpk.pk;
     if (id != this._id!) {
@@ -399,7 +399,12 @@ export default class Connection {
         const c = await decompress(cd.colors);
         if (!c) continue;
         cd.colors = c;
-        globals.pushEvent("cursor_data", cd);
+        const cursorId = String(cd.id);
+        this._cursors.set(cursorId, cd);
+        const onCursorData = (window as any).onCursorData;
+        if (typeof onCursorData === "function") {
+          onCursorData(cursorId, cd.hotx, cd.hoty, cd.width, cd.height, c);
+        }
         /*
         let ctx = cursorCanvas.getContext("2d");
         cursorCanvas.width = cd.width;
@@ -541,8 +546,13 @@ export default class Connection {
     globals.draw(display, frame);
   }
 
+  getCursorShape(id: string): message.CursorData | undefined {
+    return this._cursors.get(id);
+  }
+
   close() {
     this._msgs = [];
+    this._cursors.clear();
     clearInterval(this._interval);
     this._ws?.close();
     this._videoDecoder?.close();

@@ -500,6 +500,26 @@ document.addEventListener('fullscreenchange', () => {
   }
 });
 
+// Dart re-reads a shape the cursor cache evicted; the callback always gets 5 args.
+window.getCursorShape = (id, callback) => {
+  const cd = window.curConn?.getCursorShape(String(id));
+  if (cd) {
+    callback(cd.hotx, cd.hoty, cd.width, cd.height, cd.colors);
+  } else {
+    callback(0, 0, 0, 0, null);
+  }
+}
+
+// Keyboard shortcuts are matched on the Flutter side, as Flutter is the
+// keyboard event source on web; keep the config for reference only.
+window.reloadShortcuts = (json) => {
+  try {
+    window.keyboardShortcutsConfig = JSON.parse(json);
+  } catch (e) {
+    console.warn('Failed to parse keyboard shortcuts config:', e);
+  }
+}
+
 window.init = async () => {
   if (yuvWorker) {
     yuvWorker.onmessage = (e) => {
