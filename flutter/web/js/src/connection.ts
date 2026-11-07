@@ -165,6 +165,10 @@ export default class Connection {
   _options: any;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
+  _qualityTimer: any;
+  _qualityTick: number;
+  _frameCounts: Map<number, number>;
+  _codecFormat: string;
 
   constructor() {
     this._msgbox = globals.msgbox;
@@ -173,6 +177,9 @@ export default class Connection {
     this._id = "";
     this._videoTestSpeed = [0, 0];
     this._cursors = new Map();
+    this._qualityTick = 0;
+    this._frameCounts = new Map();
+    this._codecFormat = "";
   }
 
   async start(id: string) {
@@ -208,6 +215,10 @@ export default class Connection {
       }
     }, 1);
     this.loadVideoDecoder();
+    if (isDirectAddress(id)) {
+      await this.connectDirect(id);
+      return;
+    }
     const uri = getDefaultUri();
     const ws = new Websock(uri, true);
     this._ws = ws;
@@ -260,6 +271,20 @@ export default class Connection {
       }
       await this.connectRelay(rr);
     }
+  }
+
+  async connectDirect(id: string) {
+    const uri = getDirectUri(id);
+    this._id = id;
+    console.log(new Date() + ": Connecting directly to " + uri);
+    const ws = new Websock(uri, false);
+    this._ws = ws;
+    await ws.open();
+    console.log(new Date() + ": Connected directly");
+    // Like the native client's direct connection: no rendezvous-signed key to verify.
+    await this.secure(undefined);
+    globals.pushEvent("connection_ready", { secure: false, direct: true });
+    await this.msgLoop();
   }
 
   async connectRelay(rr: rendezvous.RelayResponse) {
@@ -363,7 +388,35 @@ export default class Connection {
     return true;
   }
 
+  startQualityStatus() {
+    clearInterval(this._qualityTimer);
+    this._qualityTick = new Date().getTime();
+    this._frameCounts.clear();
+    this._ws?.takeBytesReceived();
+    this._qualityTimer = setInterval(() => this.updateQualityStatus(), 1000);
+  }
+
+  updateQualityStatus() {
+    const now = new Date().getTime();
+    const elapsed = Math.max(now - this._qualityTick, 1);
+    this._qualityTick = now;
+    const bytes = this._ws?.takeBytesReceived() || 0;
+    const fps: Record<number, number> = {};
+    this._frameCounts.forEach((n, display) => {
+      fps[display] = Math.round((n * 1000) / elapsed);
+    });
+    this._frameCounts.clear();
+    globals.pushEvent("update_quality_status", {
+      speed: ((bytes * 1000) / elapsed / 1024).toFixed(2) + "kB/s",
+      fps: JSON.stringify(fps),
+      codec_format: this._codecFormat,
+      // The web client never advertises i444 decoding, so the peer always sends 4:2:0.
+      chroma: this._codecFormat ? "4:2:0" : "",
+    });
+  }
+
   async msgLoop() {
+    this.startQualityStatus();
     while (true) {
       const msg = (await this._ws?.next()) as message.Message;
       if (msg?.hash) {
@@ -375,6 +428,10 @@ export default class Connection {
         const test_delay = msg?.test_delay;
         console.log('test delay: ', test_delay);
         if (!test_delay.from_client) {
+          globals.pushEvent("update_quality_status", {
+            delay: String(test_delay.last_delay),
+            target_bitrate: String(test_delay.target_bitrate),
+          });
           this._ws?.sendMessage({ test_delay });
         }
       } else if (msg?.login_response) {
@@ -554,6 +611,7 @@ export default class Connection {
     this._msgs = [];
     this._cursors.clear();
     clearInterval(this._interval);
+    clearInterval(this._qualityTimer);
     this._ws?.close();
     this._videoDecoder?.close();
   }
@@ -666,6 +724,9 @@ export default class Connection {
       this.msgbox("", "", "");
       this._firstFrame = true;
     }
+    this._frameCounts.set(vf.display, (this._frameCounts.get(vf.display) || 0) + 1);
+    const codec = getCodecFormat(vf);
+    if (codec) this._codecFormat = codec;
     if (vf.vp9s) {
       const dec = this._videoDecoder;
       var tm = new Date().getTime();
@@ -1210,6 +1271,41 @@ function getrUriFromRs(
     uri += ":" + (PORT + (isRelay ? 3 : 2));
   }
   return SCHEMA + uri;
+}
+
+function getCodecFormat(vf: message.VideoFrame): string {
+  if (vf.vp9s) return "VP9";
+  if (vf.vp8s) return "VP8";
+  if (vf.av1s) return "AV1";
+  if (vf.h264s) return "H264";
+  if (vf.h265s) return "H265";
+  return "";
+}
+
+// Same forms the native client dials directly instead of asking the rendezvous server:
+// hbb_common's is_ip_str and is_domain_port_str.
+const IPV4_RE =
+  /^(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(:\d+)?$/;
+const IPV6_RE =
+  /^((([a-fA-F0-9]{1,4}:{1,2})+[a-fA-F0-9]{1,4})|(\[([a-fA-F0-9]{1,4}:{1,2})+[a-fA-F0-9]{1,4}\]:\d+))$/;
+const DOMAIN_PORT_RE =
+  /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z-]{0,61}[a-z]:\d{1,5}$/i;
+
+export function isDirectAddress(id: string): boolean {
+  return IPV4_RE.test(id) || IPV6_RE.test(id) || DOMAIN_PORT_RE.test(id);
+}
+
+// The peer's direct access port, which also accepts WebSocket upgrades.
+const DIRECT_PORT = PORT + 2;
+
+export function getDirectUri(id: string): string {
+  let host = id;
+  if (IPV6_RE.test(id)) {
+    if (!id.startsWith("[")) host = "[" + id + "]:" + DIRECT_PORT;
+  } else if (id.indexOf(":") < 0) {
+    host = id + ":" + DIRECT_PORT;
+  }
+  return SCHEMA + host;
 }
 
 function hash(datas: (string | Uint8Array)[]): Uint8Array {

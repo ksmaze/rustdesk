@@ -13,6 +13,7 @@ export default class Websock {
   _secretKey: [Uint8Array, number, number] | undefined;
   _uri: string;
   _isRendezvous: boolean;
+  _bytesReceived: number;
 
   constructor(uri: string, isRendezvous: boolean = true) {
     this._eventHandlers = {
@@ -29,6 +30,13 @@ export default class Websock {
     this._websocket.binaryType = "arraybuffer";
     this._latency = new Date().getTime();
     this._isRendezvous = isRendezvous;
+    this._bytesReceived = 0;
+  }
+
+  takeBytesReceived(): number {
+    const n = this._bytesReceived;
+    this._bytesReceived = 0;
+    return n;
   }
 
   latency(): number {
@@ -166,6 +174,7 @@ export default class Websock {
 
   _recv_message(e: any) {
     if (e.data instanceof window.ArrayBuffer) {
+      this._bytesReceived += e.data.byteLength;
       let bytes = new Uint8Array(e.data);
       const k = this._secretKey;
       if (k) {
