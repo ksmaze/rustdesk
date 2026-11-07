@@ -30,14 +30,14 @@ jobs:
           context: .
           file: Dockerfile.web
           platforms: linux/arm64
-          tags: rustdesk-web:latest
-          outputs: type=docker,dest=${{ runner.temp }}/rustdesk-web-arm64.tar
+          tags: rr-web:arm
+          outputs: type=docker,dest=${{ runner.temp }}/rr-web-arm.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Upload image tar
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustdesk-web-arm64
-          path: ${{ runner.temp }}/rustdesk-web-arm64.tar
+          archive: false
+          path: ${{ runner.temp }}/rr-web-arm.tar
           retention-days: 14
