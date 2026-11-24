@@ -34,6 +34,8 @@ type wgConfig struct {
 	listenPort int
 	mtu        int
 	peers      []wgPeer
+	// resolved holds the endpoint each peer (by public key) was configured with.
+	resolved map[string]string
 }
 
 // parseWgQuick reads the subset of a wg-quick config a userspace tunnel needs; keys that only
@@ -187,6 +189,10 @@ func (cfg *wgConfig) uapi() (string, error) {
 				return "", err
 			}
 			fmt.Fprintf(&b, "endpoint=%s\n", ep)
+			if cfg.resolved == nil {
+				cfg.resolved = map[string]string{}
+			}
+			cfg.resolved[p.publicKey] = ep
 		}
 		if p.keepalive > 0 {
 			fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", p.keepalive)
@@ -246,7 +252,7 @@ func newWgDialer(path string, verbose bool) (*wgDialer, error) {
 // refreshEndpoints re-resolves hostname endpoints, so a peer behind dynamic DNS is followed when
 // its address changes. Peers that roam on their own are left alone between changes.
 func (d *wgDialer) refreshEndpoints() {
-	last := map[string]string{}
+	last := d.cfg.resolved
 	for {
 		time.Sleep(2 * time.Minute)
 		for _, p := range d.cfg.peers {
@@ -265,7 +271,7 @@ func (d *wgDialer) refreshEndpoints() {
 				log.Printf("WireGuard endpoint %s: %v", p.endpoint, err)
 				continue
 			}
-			if prev, ok := last[p.publicKey]; ok && prev != ep {
+			if last[p.publicKey] != ep {
 				log.Printf("WireGuard endpoint %s moved to %s", p.endpoint, ep)
 				if err := d.dev.IpcSet(fmt.Sprintf("public_key=%s\nendpoint=%s\n", p.publicKey, ep)); err != nil {
 					log.Printf("WireGuard endpoint update: %v", err)
