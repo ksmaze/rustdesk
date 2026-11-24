@@ -163,6 +163,7 @@ export default class Connection {
   _videoDecoder: any;
   _password: Uint8Array | undefined;
   _pairing: SealDeskPairing | undefined;
+  _tailcatAddress: string | undefined;
   _options: any;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
@@ -304,6 +305,7 @@ export default class Connection {
     const uri = schema + location.host + "/ws/tailcat/" + encodeURIComponent(pairing.address);
     this._id = id;
     this._pairing = pairing;
+    this._tailcatAddress = pairing.address;
     console.log(new Date() + ": Connecting to SealDesk host " + (pairing.name || ""));
     const ws = new Websock(uri, false);
     this._ws = ws;
@@ -454,9 +456,13 @@ export default class Connection {
         this._hash = msg?.hash;
         const pairing = this._pairing;
         this._pairing = undefined;
-        if (!this._password && pairing) {
-          // A code without a password is for hosts that approve by click.
-          this.login(pairing.password ? { password: new TextEncoder().encode(pairing.password) } : undefined);
+        if (!this._password && pairing?.password) {
+          this.login({ password: new TextEncoder().encode(pairing.password) });
+        } else if (!this._password && pairing) {
+          // An empty login lets a host that approves by click ask its user; a password-only host
+          // waits for the password typed here.
+          this.login();
+          this.msgbox("input-password", "Password Required", "");
         } else if (!this._password)
           this.msgbox("input-password", "Password Required", "");
         this.login();
@@ -707,7 +713,8 @@ export default class Connection {
     password?: Uint8Array,
   }) {
     const login_request = message.LoginRequest.fromPartial({
-      username: this._id!,
+      // A SealDesk host only accepts its own tailcat address, not the pasted pairing code.
+      username: this._tailcatAddress || this._id!,
       my_id: "web", // to-do
       my_name: "web", // to-do
       password: login.password,
