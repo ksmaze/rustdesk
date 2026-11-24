@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -17,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -60,7 +64,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	g := &gateway{dialer: d, allow: allow, ports: ports, tailcat: tc}
+	lan, err := newLanClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	g := &gateway{dialer: d, allow: allow, ports: ports, tailcat: tc, lan: lan}
 	mux := http.NewServeMux()
 	mux.Handle(directPath, g)
 	mux.Handle(tailcatPath, g)
@@ -127,6 +135,7 @@ type gateway struct {
 	allow   []netip.Prefix
 	ports   map[int]bool
 	tailcat *tailcatDialer
+	lan     *lanClient
 }
 
 func (g *gateway) allowed(ip netip.Addr) bool {
@@ -181,6 +190,26 @@ func (g *gateway) dial(ctx context.Context, target string) (net.Conn, error) {
 	return nil, lastErr
 }
 
+// dialDirect connects to a host's direct port, encrypted when it is a SealDesk host.
+func (g *gateway) dialDirect(ctx context.Context, target string) (net.Conn, *lanStream, error) {
+	conn, err := g.dial(ctx, target)
+	if err != nil {
+		return nil, nil, err
+	}
+	deadline, _ := ctx.Deadline()
+	lan, err := g.lan.handshake(conn, conn.RemoteAddr().String(), deadline)
+	if err == nil {
+		return conn, lan, nil
+	}
+	conn.Close()
+	if !errors.Is(err, errNotSealDesk) {
+		return nil, nil, err
+	}
+	// The preface already reached a stock host, which takes the next frame as a message.
+	conn, err = g.dial(ctx, target)
+	return conn, nil, err
+}
+
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 	viaTailcat := strings.HasPrefix(path, tailcatPath)
@@ -194,20 +223,24 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var tcp net.Conn
+	var lan *lanStream
 	if viaTailcat {
 		// The tunnel's first use reaches a DERP relay and waits for the host to answer.
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		tcp, err = g.tailcat.Dial(ctx, target)
 		cancel()
 		target = target[:12] + "..."
+		if err != nil {
+			err = fmt.Errorf("no tailcat path to the SealDesk host (relay blocked, or host not sharing): %w", err)
+		}
 	} else {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		tcp, err = g.dial(ctx, target)
+		tcp, lan, err = g.dialDirect(ctx, target)
 		cancel()
 	}
 	if err != nil {
 		log.Printf("direct %s: %v", target, err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		refuse(w, r, err)
 		return
 	}
 	ws, err := upgrader.Upgrade(w, r, nil)
@@ -216,11 +249,42 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("direct %s: %v", target, err)
 		return
 	}
+	var host hostStream = newPlainStream(tcp)
+	if lan != nil {
+		host = lan
+		// SealDesk binds the password response to this handshake; the browser hashes it in.
+		note, err := json.Marshal(map[string]byteArray{"login_binder": lan.binder[:]})
+		if err == nil {
+			err = ws.WriteMessage(websocket.TextMessage, note)
+		}
+		if err != nil {
+			ws.Close()
+			tcp.Close()
+			log.Printf("direct %s: %v", target, err)
+			return
+		}
+		target += " (SealDesk LAN, encrypted)"
+	}
 	log.Printf("direct %s: connected for %s", target, r.RemoteAddr)
 	start := time.Now()
-	up, down := bridge(ws, tcp)
+	up, down := bridge(ws, tcp, host)
 	log.Printf("direct %s: closed after %s, %d bytes up, %d bytes down",
 		target, time.Since(start).Round(time.Second), up, down)
+}
+
+// refuse reports err in the close frame: an HTTP error is invisible to a page's WebSocket API.
+func refuse(w http.ResponseWriter, r *http.Request, err error) {
+	ws, uerr := upgrader.Upgrade(w, r, nil)
+	if uerr != nil {
+		return
+	}
+	reason := err.Error()
+	if len(reason) > 120 {
+		reason = reason[:120]
+	}
+	ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(4502, reason),
+		time.Now().Add(time.Second))
+	ws.Close()
 }
 
 // sameOrigin is gorilla's default origin check, run before dialing so a cross-origin page cannot

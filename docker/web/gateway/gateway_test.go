@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -31,7 +30,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 	r := bufio.NewReader(&stream)
 	for _, n := range sizes {
-		got, err := readFrame(r)
+		got, err := readFrame(r, maxFrameLength)
 		if err != nil {
 			t.Fatalf("size %d: %v", n, err)
 		}
@@ -64,20 +63,26 @@ func TestDirectOverWireGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
+	// The gateway first tries SealDesk's LAN handshake, then reconnects to a stock host.
+	echo := func(c net.Conn) {
 		defer c.Close()
 		r := bufio.NewReader(c)
 		for {
-			payload, err := readFrame(r)
+			payload, err := readFrame(r, maxFrameLength)
 			if err != nil {
 				return
 			}
 			frame, _ := encodeFrame(append([]byte("echo:"), payload...))
 			c.Write(frame)
+		}
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go echo(c)
 		}
 	}()
 
@@ -121,8 +126,13 @@ PersistentKeepalive = 25
 	}
 
 	for _, target := range []string{"10.66.0.1:22", "10.66.0.3:21118", "8.8.8.8:21118"} {
-		_, resp, err := websocket.DefaultDialer.Dial(wsURL+target, nil)
-		if err == nil || resp == nil || resp.StatusCode != http.StatusBadGateway {
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL+target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = ws.ReadMessage()
+		ws.Close()
+		if !websocket.IsCloseError(err, 4502) {
 			t.Fatalf("%s: expected refusal, got %v", target, err)
 		}
 	}

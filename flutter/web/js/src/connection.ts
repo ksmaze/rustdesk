@@ -671,6 +671,12 @@ export default class Connection {
     this._draw = callback;
   }
 
+  // SealDesk's encrypted LAN login hashes its handshake into the password response.
+  loginBinder(): Uint8Array[] {
+    const binder = this._ws?._loginBinder;
+    return binder ? [binder] : [];
+  }
+
   login(info?: {
     os_login?: message.OSLogin,
     password?: Uint8Array
@@ -680,14 +686,14 @@ export default class Connection {
       let p = hash([info.password, salt!]);
       this._password = p;
       const challenge = this._hash?.challenge;
-      p = hash([p, challenge!]);
+      p = hash([p, challenge!, ...this.loginBinder()]);
       this.msgbox("connecting", "Connecting...", "Logging in...");
       this._sendLoginMessage({ os_login: info.os_login, password: p });
     } else {
       let p = this._password;
       if (p) {
         const challenge = this._hash?.challenge;
-        p = hash([p, challenge!]);
+        p = hash([p, challenge!, ...this.loginBinder()]);
       }
       this._sendLoginMessage({ os_login: info?.os_login, password: p });
     }
