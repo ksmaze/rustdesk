@@ -101,7 +101,8 @@ PersistentKeepalive = 25
 		t.Fatal(err)
 	}
 	defer d.dev.Close()
-	g := &gateway{dialer: d, allow: d.DefaultAllowed(), ports: map[int]bool{21118: true}}
+	g := &gateway{dialer: d, allow: d.DefaultAllowed(), ports: map[int]bool{21118: true},
+		lan: &lanClient{path: filepath.Join(t.TempDir(), "lan.json"), Hosts: map[string]string{}}}
 	srv := httptest.NewServer(g)
 	defer srv.Close()
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + directPath
