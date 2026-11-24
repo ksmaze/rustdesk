@@ -206,6 +206,12 @@ func newLanClient() (*lanClient, error) {
 	return c, nil
 }
 
+func (c *lanClient) pinned(target string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Hosts[target] != ""
+}
+
 func (c *lanClient) save() error {
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {

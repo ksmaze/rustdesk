@@ -205,6 +205,9 @@ func (g *gateway) dialDirect(ctx context.Context, target string) (net.Conn, *lan
 	if !errors.Is(err, errNotSealDesk) {
 		return nil, nil, err
 	}
+	if g.lan.pinned(conn.RemoteAddr().String()) {
+		return nil, nil, fmt.Errorf("%s was a SealDesk host but did not do its encrypted handshake", target)
+	}
 	// The preface already reached a stock host, which takes the next frame as a message.
 	conn, err = g.dial(ctx, target)
 	return conn, nil, err
