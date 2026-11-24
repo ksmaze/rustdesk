@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+if [ "$1" = "wg-pair" ]; then
+    exec rustdesk-web-gateway "$@"
+fi
+
 PORT="${RUSTDESK_PORT:-5000}"
 
 # Generate config.js from environment variables
@@ -30,5 +34,4 @@ echo "    Port:             ${PORT}"
 [ -n "${RUSTDESK_RELAY_SERVER}" ] && echo "    Relay Server:     ${RUSTDESK_RELAY_SERVER}"
 echo "==> Serving from /app/web on port ${PORT}"
 
-cd /app/web
-exec python3 -m http.server "${PORT}" --bind 0.0.0.0
+exec rustdesk-web-gateway -listen "0.0.0.0:${PORT}" -root /app/web

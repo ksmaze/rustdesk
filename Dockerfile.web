@@ -11,6 +11,15 @@
 #   RUSTDESK_API_SERVER   - API server URL, e.g. "https://myserver.com:21114"
 #   RUSTDESK_RELAY_SERVER - Relay server address (if different from rendezvous)
 #   RUSTDESK_PORT         - Web server port (default: 5000)
+#
+# Direct (peer-to-peer) connections: typing an IP in the web client connects to a stock
+# RustDesk host's direct IP access port through the gateway in this image, optionally over an
+# in-process WireGuard or Tailscale tunnel. See docker/web/README.md.
+#   WG_CONFIG             - wg-quick config (default: /etc/wireguard/wg0.conf when mounted)
+#   TS_AUTHKEY            - Tailscale/Headscale auth key (or TS_ENABLE=true to log in by URL)
+#   TS_LOGIN_SERVER       - Headscale URL (default: Tailscale)
+#   GATEWAY_ALLOW_CIDRS   - Networks the gateway may dial (default: the tunnel's / private ones)
+#   GATEWAY_ALLOW_PORTS   - Ports the gateway may dial (default: 21118)
 # =============================================================================
 
 # --- Stage 1: Build the Flutter web application ---
@@ -95,9 +104,26 @@ RUN flutter pub get
 RUN flutter build web --release
 
 
-# --- Stage 2: Serve the web application ---
+# --- Stage 2: Build the web gateway ---
 
-FROM python:3.11-slim AS runtime
+FROM golang:1.27-bookworm AS gateway
+WORKDIR /src
+COPY docker/web/gateway/go.mod docker/web/gateway/go.sum ./
+RUN go mod download
+COPY docker/web/gateway/ ./
+RUN go test ./... && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /rustdesk-web-gateway .
+
+
+# --- Stage 3: Serve the web application ---
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=gateway /rustdesk-web-gateway /usr/local/bin/rustdesk-web-gateway
 
 # Copy the built web assets from the build stage
 COPY --from=build /app/rustdesk/flutter/build/web /app/web
@@ -107,6 +133,7 @@ COPY docker/web/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000
+VOLUME /var/lib/rustdesk-web
 WORKDIR /app
 
 ENTRYPOINT ["/app/entrypoint.sh"]
