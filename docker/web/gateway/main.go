@@ -189,6 +189,10 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad target", http.StatusBadRequest)
 		return
 	}
+	if !sameOrigin(r) {
+		http.Error(w, "cross-origin request refused", http.StatusForbidden)
+		return
+	}
 	var tcp net.Conn
 	if viaTailcat {
 		// The tunnel's first use reaches a DERP relay and waits for the host to answer.
@@ -217,4 +221,15 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	up, down := bridge(ws, tcp)
 	log.Printf("direct %s: closed after %s, %d bytes up, %d bytes down",
 		target, time.Since(start).Round(time.Second), up, down)
+}
+
+// sameOrigin is gorilla's default origin check, run before dialing so a cross-origin page cannot
+// make the gateway open connections even though its upgrade would be refused.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
