@@ -9,7 +9,7 @@ PORT="${RUSTDESK_PORT:-5000}"
 
 # Extra root CAs, such as a TLS-inspecting proxy's (Zscaler), mounted as PEM files in /certs.
 if [ -d /certs ]; then
-    export SSL_CERT_DIR="${SSL_CERT_DIR:-/etc/ssl/certs:/certs}"
+    export SSL_CERT_DIR="${SSL_CERT_DIR:-/etc/ssl/certs}:/certs"
 fi
 # DERP over WebSocket, for proxies that only pass WebSocket upgrades.
 if [ "${TAILCAT_DERP_WEBSOCKET}" = "true" ]; then
