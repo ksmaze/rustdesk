@@ -11,6 +11,14 @@
 #   RUSTDESK_API_SERVER   - API server URL, e.g. "https://myserver.com:21114"
 #   RUSTDESK_RELAY_SERVER - Relay server address (if different from rendezvous)
 #   RUSTDESK_PORT         - Web server port (default: 5000)
+#
+# Peer-to-peer connections go through the gateway in this image (see docker/web/README.md):
+#   - paste a SealDesk pairing code or tc... address: tailcat (WireGuard, NAT traversal)
+#   - type an IP: a stock RustDesk host's direct IP access port, optionally over WireGuard
+#   WG_CONFIG             - wg-quick config (default: /etc/wireguard/wg0.conf when mounted)
+#   GATEWAY_ALLOW_CIDRS   - Networks direct IP may dial (default: the tunnel's / private ones)
+#   GATEWAY_ALLOW_PORTS   - Ports direct IP may dial (default: 21118)
+#   TAILCAT_DERP_MAP_URL  - Alternate DERP map for SealDesk hosts that use one
 # =============================================================================
 
 # --- Stage 1: Build the Flutter web application ---
@@ -95,9 +103,26 @@ RUN flutter pub get
 RUN flutter build web --release
 
 
-# --- Stage 2: Serve the web application ---
+# --- Stage 2: Build the web gateway ---
 
-FROM python:3.11-slim AS runtime
+FROM golang:1.27-bookworm AS gateway
+WORKDIR /src
+COPY docker/web/gateway/go.mod docker/web/gateway/go.sum ./
+RUN go mod download
+COPY docker/web/gateway/ ./
+RUN go test ./... && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /rustdesk-web-gateway .
+
+
+# --- Stage 3: Serve the web application ---
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=gateway /rustdesk-web-gateway /usr/local/bin/rustdesk-web-gateway
 
 # Copy the built web assets from the build stage
 COPY --from=build /app/rustdesk/flutter/build/web /app/web
@@ -107,6 +132,7 @@ COPY docker/web/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5000
+VOLUME /var/lib/rustdesk-web
 WORKDIR /app
 
 ENTRYPOINT ["/app/entrypoint.sh"]

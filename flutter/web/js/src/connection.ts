@@ -1,5 +1,4 @@
 import Websock from "./websock";
-import WebRTCSock, { isWebrtcEnabled } from "./webrtcsock";
 import * as message from "./message.js";
 import * as rendezvous from "./rendezvous.js";
 import { loadVp9 } from "./codec";
@@ -16,8 +15,6 @@ const HOSTS = [
 ];
 let HOST = localStorage.getItem("rendezvous-server") || HOSTS[0];
 const SCHEMA = "ws://";
-const WEBRTC_CONNECT_TIMEOUT = 15000;
-const RELAY_FALLBACK_DELAY = 2500;
 
 type MsgboxCallback = (type: string, title: string, text: string, link: string) => void;
 type DrawCallback = (display: number, data: Uint8Array) => void;
@@ -155,8 +152,7 @@ function applyLockModes(events: message.KeyEvent[], lockModes: number, isNumpad:
 
 export default class Connection {
   _msgs: any[];
-  _ws: Websock | WebRTCSock | undefined;
-  _rendezvous: Websock | undefined;
+  _ws: Websock | undefined;
   _interval: any;
   _id: string;
   _hash: message.Hash | undefined;
@@ -166,6 +162,8 @@ export default class Connection {
   _firstFrame: Boolean | undefined;
   _videoDecoder: any;
   _password: Uint8Array | undefined;
+  _pairing: SealDeskPairing | undefined;
+  _tailcatAddress: string | undefined;
   _options: any;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
@@ -219,12 +217,13 @@ export default class Connection {
       }
     }, 1);
     this.loadVideoDecoder();
+    const pairing = parseSealDeskTarget(id);
+    if (pairing) {
+      await this.connectTailcat(id, pairing);
+      return;
+    }
     if (isDirectAddress(id)) {
-      this.msgbox(
-        "error",
-        "Error",
-        "Connecting by IP address is not supported in the web client, please use the ID"
-      );
+      await this.connectDirect(id);
       return;
     }
     const uri = getDefaultUri();
@@ -238,41 +237,16 @@ export default class Connection {
     console.log(new Date() + ": Connected to rendezvous server");
     const conn_type = rendezvous.ConnType.DEFAULT_CONN;
     const nat_type = rendezvous.NatType.SYMMETRIC;
-    let rtc: WebRTCSock | undefined;
-    let webrtc_sdp_offer: string | undefined;
-    if (isWebrtcEnabled()) {
-      try {
-        rtc = new WebRTCSock();
-        webrtc_sdp_offer = await rtc.createOffer();
-      } catch (e) {
-        console.warn("WebRTC offer failed: ", e);
-        rtc?.close();
-        rtc = undefined;
-      }
-    }
     const punch_hole_request = rendezvous.PunchHoleRequest.fromPartial({
       id,
       licence_key: localStorage.getItem("key") || undefined,
       conn_type,
       nat_type,
       token: localStorage.getItem("access_token") || undefined,
-      webrtc_sdp_offer,
     });
     ws.sendRendezvous({ punch_hole_request });
-    let msg: rendezvous.RendezvousMessage;
-    const pendingIce: string[] = [];
-    if (rtc) {
-      this._rendezvous = ws;
-      msg = await this.nextPunchResponse(ws, rtc, pendingIce);
-      if (!msg.relay_response?.webrtc_sdp_answer) {
-        rtc.close();
-        rtc = undefined;
-        ws.close();
-      }
-    } else {
-      msg = (await ws.next()) as rendezvous.RendezvousMessage;
-      ws.close();
-    }
+    const msg = (await ws.next()) as rendezvous.RendezvousMessage;
+    ws.close();
     console.log(new Date() + ": Got relay response");
     const phr = msg.punch_hole_response;
     const rr = msg.relay_response;
@@ -300,16 +274,50 @@ export default class Connection {
     } else if (rr) {
       if (!rr.version) {
         this.msgbox("error", "Error", "Remote version is low, not support web");
-        rtc?.close();
-        this._rendezvous?.close();
         return;
       }
-      if (rtc) {
-        await this.connectWebRTC(rr, rtc, pendingIce);
-      } else {
-        await this.connectRelay(rr);
-      }
+      await this.connectRelay(rr);
     }
+  }
+
+  async connectDirect(id: string) {
+    const uri = getDirectUri(id);
+    this._id = id;
+    console.log(new Date() + ": Connecting directly to " + uri);
+    const ws = new Websock(uri, false);
+    this._ws = ws;
+    try {
+      await ws.open();
+    } catch (e) {
+      throw "Failed to reach " + id + " through the web gateway. Check the gateway's tunnel, and that direct IP access is enabled on the remote side";
+    }
+    console.log(new Date() + ": Connected directly");
+    // Like the native client's direct connection: no rendezvous-signed key to verify.
+    await this.secure(undefined);
+    globals.pushEvent("connection_ready", { secure: false, direct: true });
+    await this.msgLoop();
+  }
+
+  // A SealDesk host, by its pairing code or tailcat address. The gateway serving this page holds
+  // the tailcat (WireGuard) tunnel; the host runs a plain session on it, as for direct IP.
+  async connectTailcat(id: string, pairing: SealDeskPairing) {
+    const schema = location.protocol == "https:" ? "wss://" : "ws://";
+    const uri = schema + location.host + "/ws/tailcat/" + encodeURIComponent(pairing.address);
+    this._id = id;
+    this._pairing = pairing;
+    this._tailcatAddress = pairing.address;
+    console.log(new Date() + ": Connecting to SealDesk host " + (pairing.name || ""));
+    const ws = new Websock(uri, false);
+    this._ws = ws;
+    try {
+      await ws.open(40000);
+    } catch (e) {
+      throw "Failed to reach the SealDesk host through the web gateway. Check that the host is sharing and the pairing code is current";
+    }
+    console.log(new Date() + ": Connected to SealDesk host");
+    await this.secure(undefined);
+    globals.pushEvent("connection_ready", { secure: false, direct: false });
+    await this.msgLoop();
   }
 
   async connectRelay(rr: rendezvous.RelayResponse) {
@@ -336,123 +344,7 @@ export default class Connection {
     await this.msgLoop();
   }
 
-  // The punch response, with the peer's ICE candidates that arrive before it kept for later.
-  async nextPunchResponse(
-    ws: Websock,
-    rtc: WebRTCSock,
-    pendingIce: string[]
-  ): Promise<rendezvous.RendezvousMessage> {
-    while (true) {
-      const msg = (await ws.next()) as rendezvous.RendezvousMessage;
-      const ice = msg.ice_candidate;
-      if (!ice) return msg;
-      if (ice.session_key == rtc.sessionKey && ice.candidate) {
-        pendingIce.push(ice.candidate);
-      }
-    }
-  }
-
-  // Trickle ICE candidates through the rendezvous connection until it is closed.
-  async bridgeIce(ws: Websock, rtc: WebRTCSock) {
-    rtc.onLocalCandidate((candidate) => {
-      const ice_candidate = rendezvous.IceCandidate.fromPartial({
-        id: this._id,
-        session_key: rtc.sessionKey,
-        candidate,
-      });
-      ws.sendRendezvous({ ice_candidate });
-      // The hop from the rendezvous server to the peer may be UDP, so send each one twice.
-      setTimeout(() => ws.sendRendezvous({ ice_candidate }), 400);
-    });
-    while (true) {
-      let msg: rendezvous.RendezvousMessage;
-      try {
-        msg = (await ws.next(1000)) as rendezvous.RendezvousMessage;
-      } catch (e) {
-        if (e === "Timeout") continue;
-        return;
-      }
-      const ice = msg.ice_candidate;
-      if (ice && ice.session_key == rtc.sessionKey && ice.candidate) {
-        rtc.addRemoteCandidate(ice.candidate);
-      }
-    }
-  }
-
-  async openRelay(rr: rendezvous.RelayResponse): Promise<Websock | undefined> {
-    let uri = rr.relay_server;
-    if (uri) {
-      uri = getrUriFromRs(uri, true, 2);
-    } else {
-      uri = getDefaultUri(true);
-    }
-    const ws = new Websock(uri, false);
-    try {
-      await ws.open();
-    } catch (e) {
-      console.warn("Failed to connect to relay server: ", e);
-      return undefined;
-    }
-    const request_relay = rendezvous.RequestRelay.fromPartial({
-      licence_key: localStorage.getItem("key") || undefined,
-      uuid: rr.uuid,
-    });
-    ws.sendRendezvous({ request_relay });
-    return ws;
-  }
-
-  // Race WebRTC against the relay, preferring WebRTC for a while once the relay is ready, as the
-  // native client does.
-  async connectWebRTC(
-    rr: rendezvous.RelayResponse,
-    rtc: WebRTCSock,
-    pendingIce: string[]
-  ) {
-    const ws = this._rendezvous!;
-    const relay = this.openRelay(rr);
-    let rtcOpen: Promise<boolean>;
-    try {
-      await rtc.setAnswer(rr.webrtc_sdp_answer);
-      pendingIce.forEach((candidate) => rtc.addRemoteCandidate(candidate));
-      this.bridgeIce(ws, rtc);
-      rtcOpen = rtc.waitOpen(WEBRTC_CONNECT_TIMEOUT).then(
-        () => true,
-        (e) => {
-          console.warn(e);
-          return false;
-        }
-      );
-    } catch (e) {
-      console.warn("Failed to set WebRTC answer: ", e);
-      rtcOpen = Promise.resolve(false);
-    }
-    const useRtc =
-      (await Promise.race([rtcOpen, relay.then(() => false)])) ||
-      ((await relay)
-        ? await Promise.race([rtcOpen, sleep(RELAY_FALLBACK_DELAY).then(() => false)])
-        : await rtcOpen);
-    ws.close();
-    this._rendezvous = undefined;
-    if (!useRtc) {
-      rtc.close();
-      const relayWs = await relay;
-      if (!relayWs) throw new Error("Failed to connect to relay server");
-      this._ws = relayWs;
-      const secure = (await this.secure(rr.pk)) || false;
-      globals.pushEvent("connection_ready", { secure, direct: false });
-      await this.msgLoop();
-      return;
-    }
-    relay.then((relayWs) => relayWs?.close());
-    console.log(new Date() + ": Connected with WebRTC");
-    this._ws = rtc;
-    const secure = (await this.secure(rr.pk, rtc)) || false;
-    const direct = !(await rtc.isRelayed());
-    globals.pushEvent("connection_ready", { secure, direct, stream_type: "WebRTC" });
-    await this.msgLoop();
-  }
-
-  async secure(pk: Uint8Array | undefined, rtc?: WebRTCSock) {
+  async secure(pk: Uint8Array | undefined) {
     if (pk) {
       const RS_PK = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
       try {
@@ -484,7 +376,6 @@ export default class Connection {
     const msg = (await this._ws?.next()) as message.Message;
     let signedId: any = msg?.signed_id;
     if (!signedId) {
-      if (rtc) throw new Error("WebRTC handshake received an unexpected message type");
       console.error("Handshake failed: invalid message type");
       const public_key = message.PublicKey.fromPartial({});
       this._ws?.sendMessage({ public_key });
@@ -494,7 +385,6 @@ export default class Connection {
       signedId = await globals.verify(signedId.id, Uint8Array.from(pk!));
     } catch (e) {
       console.error('Failed to verify signed id pk, ', e);
-      if (rtc) throw new Error("WebRTC peer identity could not be verified");
       // fall back to non-secure connection in case pk mismatch
       console.error("pk mismatch, fall back to non-secure");
       const public_key = message.PublicKey.fromPartial({});
@@ -504,11 +394,6 @@ export default class Connection {
     const idpk = rendezvous.IdPk.decode(signedId);
     const id = idpk.id;
     const theirPk = idpk.pk;
-    // The browser bound the DTLS certificate to the answer's fingerprint; the peer must have
-    // signed that same fingerprint, or a rendezvous/relay swapped the SDP.
-    if (rtc && (id != this._id || !idpk.dtls_fingerprint || idpk.dtls_fingerprint != rtc.remoteFingerprint)) {
-      throw new Error("WebRTC DTLS fingerprint not bound to peer identity (possible MITM)");
-    }
     if (id != this._id!) {
       console.error("Handshake failed: sign failure");
       const public_key = message.PublicKey.fromPartial({});
@@ -569,7 +454,16 @@ export default class Connection {
       const msg = (await this._ws?.next()) as message.Message;
       if (msg?.hash) {
         this._hash = msg?.hash;
-        if (!this._password)
+        const pairing = this._pairing;
+        this._pairing = undefined;
+        if (!this._password && pairing?.password) {
+          this.login({ password: new TextEncoder().encode(pairing.password) });
+        } else if (!this._password && pairing) {
+          // An empty login lets a host that approves by click ask its user; a password-only host
+          // waits for the password typed here.
+          this.login();
+          this.msgbox("input-password", "Password Required", "");
+        } else if (!this._password)
           this.msgbox("input-password", "Password Required", "");
         this.login();
       } else if (msg?.test_delay) {
@@ -761,7 +655,6 @@ export default class Connection {
     clearInterval(this._interval);
     clearInterval(this._qualityTimer);
     this._ws?.close();
-    this._rendezvous?.close();
     this._videoDecoder?.close();
   }
 
@@ -820,7 +713,8 @@ export default class Connection {
     password?: Uint8Array,
   }) {
     const login_request = message.LoginRequest.fromPartial({
-      username: this._id!,
+      // A SealDesk host only accepts its own tailcat address, not the pasted pairing code.
+      username: this._tailcatAddress || this._id!,
       my_id: "web", // to-do
       my_name: "web", // to-do
       password: login.password,
@@ -1444,6 +1338,84 @@ export function isDirectAddress(id: string): boolean {
   return IPV4_RE.test(id) || IPV6_RE.test(id) || DOMAIN_PORT_RE.test(id);
 }
 
+// The peer's direct access port. Browsers cannot open TCP sockets, so the gateway serving this
+// page (docker/web/gateway) dials it, over WireGuard when configured to.
+const DIRECT_PORT = PORT + 2;
+
+export interface SealDeskPairing {
+  address: string;
+  password?: string;
+  name?: string;
+}
+
+// SealDesk's is_addr: "tc" followed by unpadded base64url.
+function isTailcatAddr(s: string): boolean {
+  return s.length > 40 && /^tc[A-Za-z0-9_-]+$/.test(s);
+}
+
+// A SealDesk pairing code, the text form of its QR code ("SEALDESK:V:1;A:tc...;P:...;N:...;E:...;;"),
+// or a bare tailcat address. Mirrors SealDesk's PairingCode::parse; throws on a malformed code.
+export function parseSealDeskTarget(input: string): SealDeskPairing | undefined {
+  input = input.trim();
+  if (isTailcatAddr(input)) return { address: input };
+  if (input.slice(0, 9).toUpperCase() != "SEALDESK:") return undefined;
+  const invalid = "Invalid SealDesk pairing code";
+  const fields: Record<string, string> = {};
+  let field = "";
+  let escaped = false;
+  let finished = false;
+  const body = input.slice(9);
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (escaped) {
+      if ('\\;,:"'.indexOf(c) < 0) throw "Invalid pairing code escape";
+      field += c;
+      escaped = false;
+    } else if (c == "\\") {
+      if (field.indexOf(":") < 0) throw "Invalid pairing code escape";
+      escaped = true;
+    } else if (c == ";") {
+      if (!field) {
+        if (i + 1 < body.length) throw invalid;
+        finished = true;
+        break;
+      }
+      const sep = field.indexOf(":");
+      if (sep <= 0) throw invalid;
+      const key = field.slice(0, sep);
+      if (["V", "A", "P", "N", "E"].indexOf(key) >= 0) {
+        if (key in fields) throw "Duplicate pairing field: " + key;
+        fields[key] = field.slice(sep + 1);
+      }
+      field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (escaped) throw "Invalid pairing code escape";
+  if (!finished) throw invalid;
+  if (fields.V === undefined) throw "Missing pairing field: V";
+  if (fields.V != "1") throw "Unsupported pairing version; please upgrade SealDesk";
+  if (fields.A === undefined) throw "Missing pairing field: A";
+  if (!isTailcatAddr(fields.A)) throw "Invalid tailcat address";
+  if (fields.E !== undefined) {
+    if (!/^\d+$/.test(fields.E)) throw "Invalid pairing expiry timestamp";
+    if (Number(fields.E) <= Date.now() / 1000)
+      throw "Pairing code expired; ask the host to refresh the QR code";
+  }
+  return { address: fields.A, password: fields.P || undefined, name: fields.N || undefined };
+}
+
+export function getDirectUri(id: string): string {
+  let host = id;
+  if (IPV6_RE.test(id)) {
+    if (!id.startsWith("[")) host = "[" + id + "]:" + DIRECT_PORT;
+  } else if (id.indexOf(":") < 0) {
+    host = id + ":" + DIRECT_PORT;
+  }
+  const schema = location.protocol == "https:" ? "wss://" : "ws://";
+  return schema + location.host + "/ws/direct/" + encodeURIComponent(host);
+}
 
 function hash(datas: (string | Uint8Array)[]): Uint8Array {
   const hasher = new sha256.Hash();
