@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -45,9 +46,12 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 		n |= int(b) << (8 * i)
 	}
 	n >>= 2
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(r, payload); err != nil {
+	// Grow with the bytes that arrive rather than trusting the declared length up front.
+	var payload bytes.Buffer
+	if got, err := payload.ReadFrom(io.LimitReader(r, int64(n))); err != nil {
 		return nil, err
+	} else if got != int64(n) {
+		return nil, io.ErrUnexpectedEOF
 	}
-	return payload, nil
+	return payload.Bytes(), nil
 }
