@@ -221,7 +221,11 @@ func (c *lanClient) save() error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(c.path, data, 0o600)
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
 }
 
 // handshake runs the client side of SealDesk's LAN handshake on conn, returning errNotSealDesk
