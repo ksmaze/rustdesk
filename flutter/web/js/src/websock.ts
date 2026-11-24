@@ -14,6 +14,7 @@ export default class Websock {
   _uri: string;
   _isRendezvous: boolean;
   _bytesReceived: number;
+  _loginBinder: Uint8Array | undefined;
 
   constructor(uri: string, isRendezvous: boolean = true) {
     this._eventHandlers = {
@@ -110,7 +111,8 @@ export default class Websock {
           // e.code 1000 means that the connection was closed normally.
           //
         }
-        this._status = e;
+        // The web gateway gives the reason it could not reach the host in its close frame.
+        this._status = e.code >= 4000 && e.reason ? e.reason : e;
         console.error("WebSock.onclose: ");
         console.error(e);
         this._eventHandlers.close(e);
@@ -173,6 +175,16 @@ export default class Websock {
   }
 
   _recv_message(e: any) {
+    if (typeof e.data === "string") {
+      // The web gateway's note on the host stream it holds: SealDesk's LAN login binder.
+      try {
+        const binder = JSON.parse(e.data).login_binder;
+        if (Array.isArray(binder)) this._loginBinder = Uint8Array.from(binder);
+      } catch (err) {
+        console.error("Invalid gateway message: " + err);
+      }
+      return;
+    }
     if (e.data instanceof window.ArrayBuffer) {
       this._bytesReceived += e.data.byteLength;
       let bytes = new Uint8Array(e.data);

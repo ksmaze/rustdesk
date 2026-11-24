@@ -47,6 +47,28 @@ accepts by click, waits for the host to approve.
 If the host uses an allow list (`sealdesk --tc-allow`), add the gateway's controller key. The
 gateway logs it at startup as `SealDesk controller identity: nodekey:...`.
 
+### SealDesk on the same LAN
+
+Type the host's LAN IP (e.g. `192.168.2.159`) instead of the pairing code, then its password.
+The gateway speaks SealDesk's encrypted LAN protocol (signed handshake, per-direction session
+keys), so this needs no relay or internet, and RustDesk compatibility mode can stay off. The
+gateway trusts the host key it first sees at an address and refuses a different one later. The
+keys are kept in `/var/lib/rustdesk-web/sealdesk-lan.json`; delete an entry to trust a new key.
+
+### Behind a TLS-inspecting proxy (e.g. Zscaler)
+
+A proxy that re-signs TLS breaks the relay connection, which the log shows as
+`tlsdial: error: server cert for "...ipn.dev" failed both system roots & Let's Encrypt root
+validation`. Mount the proxy's root CA as PEM into `/certs`. If the proxy only lets WebSocket
+upgrades through, also set `TAILCAT_DERP_WEBSOCKET=true`.
+
+```sh
+security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain > zscaler.pem
+docker run -d --name rustdesk-web -p 127.0.0.1:5000:5000 \
+  -v rustdesk-web:/var/lib/rustdesk-web \
+  -v "$PWD/zscaler.pem:/certs/zscaler.pem:ro" -e TAILCAT_DERP_WEBSOCKET=true rr-web:arm
+```
+
 ## Stock RustDesk host: Windows
 
 1. Install RustDesk. In **Settings → Security**, turn on **Enable direct IP access** (port 21118),

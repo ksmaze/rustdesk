@@ -31,7 +31,7 @@ func encodeFrame(payload []byte) ([]byte, error) {
 	return append(head, payload...), nil
 }
 
-func readFrame(r *bufio.Reader) ([]byte, error) {
+func readFrame(r *bufio.Reader, limit int) ([]byte, error) {
 	first, err := r.ReadByte()
 	if err != nil {
 		return nil, err
@@ -46,6 +46,9 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 		n |= int(b) << (8 * i)
 	}
 	n >>= 2
+	if n > limit {
+		return nil, fmt.Errorf("frame of %d bytes exceeds %d", n, limit)
+	}
 	// Grow with the bytes that arrive rather than trusting the declared length up front.
 	var payload bytes.Buffer
 	if got, err := payload.ReadFrom(io.LimitReader(r, int64(n))); err != nil {

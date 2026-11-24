@@ -14,11 +14,14 @@
 #
 # Peer-to-peer connections go through the gateway in this image (see docker/web/README.md):
 #   - paste a SealDesk pairing code or tc... address: tailcat (WireGuard, NAT traversal)
-#   - type an IP: a stock RustDesk host's direct IP access port, optionally over WireGuard
+#   - type an IP: a SealDesk host's encrypted LAN port, or a stock RustDesk host's direct IP
+#     access port, optionally over WireGuard
 #   WG_CONFIG             - wg-quick config (default: /etc/wireguard/wg0.conf when mounted)
 #   GATEWAY_ALLOW_CIDRS   - Networks direct IP may dial (default: the tunnel's / private ones)
 #   GATEWAY_ALLOW_PORTS   - Ports direct IP may dial (default: 21118)
 #   TAILCAT_DERP_MAP_URL  - Alternate DERP map for SealDesk hosts that use one
+#   TAILCAT_DERP_WEBSOCKET - "true" to reach DERP relays over WebSocket (proxies that allow only that)
+#   /certs/*.pem          - Extra root CAs, e.g. a TLS-inspecting proxy's
 # =============================================================================
 
 # --- Stage 1: Build the Flutter web application ---
@@ -111,7 +114,7 @@ COPY docker/web/gateway/go.mod docker/web/gateway/go.sum ./
 RUN go mod download
 COPY docker/web/gateway/ ./
 RUN go test ./... && \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /rustdesk-web-gateway .
+    CGO_ENABLED=0 go build -trimpath -tags ts_debug_websockets -ldflags="-s -w" -o /rustdesk-web-gateway .
 
 
 # --- Stage 3: Serve the web application ---

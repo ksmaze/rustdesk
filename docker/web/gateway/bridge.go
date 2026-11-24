@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"net"
 	"sync"
 
@@ -16,7 +15,7 @@ var upgrader = websocket.Upgrader{
 
 // bridge carries one protobuf message per WebSocket message on the browser side and
 // BytesCodec frames on the host side, the conversion hbbr makes between web and native peers.
-func bridge(ws *websocket.Conn, tcp net.Conn) (up, down int64) {
+func bridge(ws *websocket.Conn, tcp net.Conn, host hostStream) (up, down int64) {
 	ws.SetReadLimit(maxFrameLength)
 	var once sync.Once
 	closeBoth := func() {
@@ -30,9 +29,8 @@ func bridge(ws *websocket.Conn, tcp net.Conn) (up, down int64) {
 	go func() {
 		defer wg.Done()
 		defer closeBoth()
-		r := bufio.NewReaderSize(tcp, 64<<10)
 		for {
-			payload, err := readFrame(r)
+			payload, err := host.readFrame()
 			if err != nil {
 				ws.WriteMessage(websocket.CloseMessage,
 					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
@@ -54,11 +52,7 @@ func bridge(ws *websocket.Conn, tcp net.Conn) (up, down int64) {
 			if kind != websocket.BinaryMessage {
 				continue
 			}
-			frame, err := encodeFrame(payload)
-			if err != nil {
-				return
-			}
-			if _, err := tcp.Write(frame); err != nil {
+			if err := host.writeFrame(payload); err != nil {
 				return
 			}
 			up += int64(len(payload))

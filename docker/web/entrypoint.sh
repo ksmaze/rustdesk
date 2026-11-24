@@ -7,6 +7,15 @@ fi
 
 PORT="${RUSTDESK_PORT:-5000}"
 
+# Extra root CAs, such as a TLS-inspecting proxy's (Zscaler), mounted as PEM files in /certs.
+if [ -d /certs ]; then
+    export SSL_CERT_DIR="${SSL_CERT_DIR:-/etc/ssl/certs}:/certs"
+fi
+# DERP over WebSocket, for proxies that only pass WebSocket upgrades.
+if [ "${TAILCAT_DERP_WEBSOCKET}" = "true" ]; then
+    export TS_DEBUG_DERP_WS_CLIENT=true
+fi
+
 # Generate config.js from environment variables
 cat > /app/web/config.js <<CONFIGEOF
 // Auto-generated RustDesk web client configuration
