@@ -316,13 +316,22 @@ func (c *lanClient) handshake(conn net.Conn, target string, deadline time.Time) 
 	conn.SetDeadline(time.Time{})
 	if known == "" {
 		c.mu.Lock()
-		c.Hosts[target] = hostKey
-		err := c.save()
+		known = c.Hosts[target]
+		if known == "" {
+			c.Hosts[target] = hostKey
+			err = c.save()
+		}
 		c.mu.Unlock()
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("SealDesk LAN host %s trusted with key %s", target, hostKey)
+		if known != "" && known != hostKey {
+			return nil, fmt.Errorf("SealDesk host identity at %s changed; remove it from %s to trust the new one",
+				target, c.path)
+		}
+		if known == "" {
+			log.Printf("SealDesk LAN host %s trusted with key %s", target, hostKey)
+		}
 	}
 	return s, nil
 }
