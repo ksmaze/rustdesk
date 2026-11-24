@@ -162,6 +162,7 @@ export default class Connection {
   _firstFrame: Boolean | undefined;
   _videoDecoder: any;
   _password: Uint8Array | undefined;
+  _pairing: SealDeskPairing | undefined;
   _options: any;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
@@ -215,6 +216,11 @@ export default class Connection {
       }
     }, 1);
     this.loadVideoDecoder();
+    const pairing = parseSealDeskTarget(id);
+    if (pairing) {
+      await this.connectTailcat(id, pairing);
+      return;
+    }
     if (isDirectAddress(id)) {
       await this.connectDirect(id);
       return;
@@ -288,6 +294,27 @@ export default class Connection {
     // Like the native client's direct connection: no rendezvous-signed key to verify.
     await this.secure(undefined);
     globals.pushEvent("connection_ready", { secure: false, direct: true });
+    await this.msgLoop();
+  }
+
+  // A SealDesk host, by its pairing code or tailcat address. The gateway serving this page holds
+  // the tailcat (WireGuard) tunnel; the host runs a plain session on it, as for direct IP.
+  async connectTailcat(id: string, pairing: SealDeskPairing) {
+    const schema = location.protocol == "https:" ? "wss://" : "ws://";
+    const uri = schema + location.host + "/ws/tailcat/" + encodeURIComponent(pairing.address);
+    this._id = id;
+    this._pairing = pairing;
+    console.log(new Date() + ": Connecting to SealDesk host " + (pairing.name || ""));
+    const ws = new Websock(uri, false);
+    this._ws = ws;
+    try {
+      await ws.open(40000);
+    } catch (e) {
+      throw "Failed to reach the SealDesk host through the web gateway. Check that the host is sharing and the pairing code is current";
+    }
+    console.log(new Date() + ": Connected to SealDesk host");
+    await this.secure(undefined);
+    globals.pushEvent("connection_ready", { secure: false, direct: false });
     await this.msgLoop();
   }
 
@@ -425,7 +452,12 @@ export default class Connection {
       const msg = (await this._ws?.next()) as message.Message;
       if (msg?.hash) {
         this._hash = msg?.hash;
-        if (!this._password)
+        const pairing = this._pairing;
+        this._pairing = undefined;
+        if (!this._password && pairing) {
+          // A code without a password is for hosts that approve by click.
+          this.login(pairing.password ? { password: new TextEncoder().encode(pairing.password) } : undefined);
+        } else if (!this._password)
           this.msgbox("input-password", "Password Required", "");
         this.login();
       } else if (msg?.test_delay) {
@@ -1302,6 +1334,70 @@ export function isDirectAddress(id: string): boolean {
 // The peer's direct access port. Browsers cannot open TCP sockets, so the gateway serving this
 // page (docker/web/gateway) dials it, over WireGuard when configured to.
 const DIRECT_PORT = PORT + 2;
+
+export interface SealDeskPairing {
+  address: string;
+  password?: string;
+  name?: string;
+}
+
+// SealDesk's is_addr: "tc" followed by unpadded base64url.
+function isTailcatAddr(s: string): boolean {
+  return s.length > 40 && /^tc[A-Za-z0-9_-]+$/.test(s);
+}
+
+// A SealDesk pairing code, the text form of its QR code ("SEALDESK:V:1;A:tc...;P:...;N:...;E:...;;"),
+// or a bare tailcat address. Mirrors SealDesk's PairingCode::parse; throws on a malformed code.
+export function parseSealDeskTarget(input: string): SealDeskPairing | undefined {
+  input = input.trim();
+  if (isTailcatAddr(input)) return { address: input };
+  if (input.slice(0, 9).toUpperCase() != "SEALDESK:") return undefined;
+  const invalid = "Invalid SealDesk pairing code";
+  const fields: Record<string, string> = {};
+  let field = "";
+  let escaped = false;
+  let finished = false;
+  const body = input.slice(9);
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (escaped) {
+      if ('\\;,:"'.indexOf(c) < 0) throw "Invalid pairing code escape";
+      field += c;
+      escaped = false;
+    } else if (c == "\\") {
+      if (field.indexOf(":") < 0) throw "Invalid pairing code escape";
+      escaped = true;
+    } else if (c == ";") {
+      if (!field) {
+        if (i + 1 < body.length) throw invalid;
+        finished = true;
+        break;
+      }
+      const sep = field.indexOf(":");
+      if (sep <= 0) throw invalid;
+      const key = field.slice(0, sep);
+      if (["V", "A", "P", "N", "E"].indexOf(key) >= 0) {
+        if (key in fields) throw "Duplicate pairing field: " + key;
+        fields[key] = field.slice(sep + 1);
+      }
+      field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (escaped) throw "Invalid pairing code escape";
+  if (!finished) throw invalid;
+  if (fields.V === undefined) throw "Missing pairing field: V";
+  if (fields.V != "1") throw "Unsupported pairing version; please upgrade SealDesk";
+  if (fields.A === undefined) throw "Missing pairing field: A";
+  if (!isTailcatAddr(fields.A)) throw "Invalid tailcat address";
+  if (fields.E !== undefined) {
+    if (!/^\d+$/.test(fields.E)) throw "Invalid pairing expiry timestamp";
+    if (Number(fields.E) <= Date.now() / 1000)
+      throw "Pairing code expired; ask the host to refresh the QR code";
+  }
+  return { address: fields.A, password: fields.P || undefined, name: fields.N || undefined };
+}
 
 export function getDirectUri(id: string): string {
   let host = id;

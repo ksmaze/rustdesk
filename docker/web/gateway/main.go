@@ -1,11 +1,11 @@
-// rustdesk-web-gateway serves the RustDesk web client and bridges its WebSocket to a stock
-// RustDesk host's direct IP access port (TCP 21118), optionally over an in-process WireGuard
-// or Tailscale tunnel. Browsers cannot open UDP or raw TCP sockets, so the tunnel ends here.
+// rustdesk-web-gateway serves the RustDesk web client and bridges its WebSocket to a RustDesk
+// session stream: a SealDesk host's tailcat address, or a stock host's direct IP access port
+// (TCP 21118), optionally over an in-process WireGuard tunnel. Browsers cannot open UDP or raw
+// TCP sockets, so the tunnel ends here.
 package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -19,7 +19,10 @@ import (
 	"time"
 )
 
-const directPath = "/ws/direct/"
+const (
+	directPath  = "/ws/direct/"
+	tailcatPath = "/ws/tailcat/"
+)
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -53,9 +56,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	g := &gateway{dialer: d, allow: allow, ports: ports}
+	tc, err := newTailcatDialer()
+	if err != nil {
+		log.Fatal(err)
+	}
+	g := &gateway{dialer: d, allow: allow, ports: ports, tailcat: tc}
 	mux := http.NewServeMux()
 	mux.Handle(directPath, g)
+	mux.Handle(tailcatPath, g)
 	mux.Handle("/", http.FileServer(http.Dir(*root)))
 	log.Printf("Serving %s on %s, direct connections via %s to %v ports %v",
 		*root, *listen, d.Name(), describeAllow(allow), ports)
@@ -69,17 +77,10 @@ func newDialer(verbose bool) (dialer, error) {
 			wgConf = "/etc/wireguard/wg0.conf"
 		}
 	}
-	useTailscale := os.Getenv("TS_AUTHKEY") != "" || strings.EqualFold(os.Getenv("TS_ENABLE"), "true")
-	switch {
-	case wgConf != "" && useTailscale:
-		return nil, errors.New("configure either WireGuard (WG_CONFIG) or Tailscale (TS_*), not both")
-	case wgConf != "":
+	if wgConf != "" {
 		return newWgDialer(wgConf, verbose)
-	case useTailscale:
-		return newTailscaleDialer(verbose)
-	default:
-		return &systemDialer{net.Dialer{Timeout: 10 * time.Second}}, nil
 	}
+	return &systemDialer{net.Dialer{Timeout: 10 * time.Second}}, nil
 }
 
 // parseAllowList takes comma separated CIDRs; "any" allows every address.
@@ -122,9 +123,10 @@ func describeAllow(allow []netip.Prefix) string {
 }
 
 type gateway struct {
-	dialer dialer
-	allow  []netip.Prefix
-	ports  map[int]bool
+	dialer  dialer
+	allow   []netip.Prefix
+	ports   map[int]bool
+	tailcat *tailcatDialer
 }
 
 func (g *gateway) allowed(ip netip.Addr) bool {
@@ -180,14 +182,25 @@ func (g *gateway) dial(ctx context.Context, target string) (net.Conn, error) {
 }
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	target, err := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), directPath))
-	if err != nil {
+	path := r.URL.EscapedPath()
+	viaTailcat := strings.HasPrefix(path, tailcatPath)
+	target, err := url.PathUnescape(strings.TrimPrefix(strings.TrimPrefix(path, directPath), tailcatPath))
+	if err != nil || viaTailcat && g.tailcat == nil {
 		http.Error(w, "bad target", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	tcp, err := g.dial(ctx, target)
-	cancel()
+	var tcp net.Conn
+	if viaTailcat {
+		// The tunnel's first use reaches a DERP relay and waits for the host to answer.
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		tcp, err = g.tailcat.Dial(ctx, target)
+		cancel()
+		target = target[:12] + "..."
+	} else {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		tcp, err = g.dial(ctx, target)
+		cancel()
+	}
 	if err != nil {
 		log.Printf("direct %s: %v", target, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
