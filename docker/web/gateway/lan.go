@@ -113,15 +113,16 @@ type hostStream interface {
 }
 
 type plainStream struct {
-	r *bufio.Reader
-	w io.Writer
+	r     *bufio.Reader
+	w     io.Writer
+	limit int
 }
 
 func newPlainStream(conn net.Conn) *plainStream {
-	return &plainStream{bufio.NewReaderSize(conn, 64<<10), conn}
+	return &plainStream{bufio.NewReaderSize(conn, 64<<10), conn, maxFrameLength}
 }
 
-func (s *plainStream) readFrame() ([]byte, error) { return readFrame(s.r, maxFrameLength) }
+func (s *plainStream) readFrame() ([]byte, error) { return readFrame(s.r, s.limit) }
 
 func (s *plainStream) writeFrame(payload []byte) error {
 	frame, err := encodeFrame(payload)
@@ -303,7 +304,9 @@ func (c *lanClient) handshake(conn net.Conn, target string, deadline time.Time) 
 	if s.recv, err = subkey(2); err != nil {
 		return nil, err
 	}
+	plain.limit = lanFrameLimit
 	confirm, err := s.readFrame()
+	plain.limit = maxFrameLength
 	if err != nil {
 		return nil, fmt.Errorf("SealDesk LAN key confirmation: %w", err)
 	}
