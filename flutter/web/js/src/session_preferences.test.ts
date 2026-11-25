@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { customVideoOptions, isAudioMuted } from "./session_preferences.js";
+import { customVideoOptions, sessionToggle } from "./session_preferences.js";
 
-test("new peers inherit Mute and an explicitly unmuted peer stays unmuted", () => {
-  const defaults = { disable_audio: "Y" };
-  assert.equal(isAudioMuted({}, defaults), true);
-  assert.equal(isAudioMuted({ "disable-audio": false }, defaults), false);
-  assert.equal(isAudioMuted({}, {}), false);
+test("session toggles inherit display defaults and respect explicit peer overrides", () => {
+  const defaults = { disable_audio: "Y", follow_remote_window: "Y", "zoom-cursor": "Y" };
+  assert.equal(sessionToggle({}, defaults, "disable-audio"), true);
+  assert.equal(sessionToggle({ "disable-audio": false }, defaults, "disable-audio"), false);
+  assert.equal(sessionToggle({}, defaults, "follow-remote-window"), true);
+  assert.equal(sessionToggle({ "zoom-cursor": "" }, defaults, "zoom-cursor"), false);
+  assert.equal(sessionToggle({ "view-only": "N" }, {}, "view-only"), false);
 });
 
 test("custom video settings encode the saved slider values for a LAN session", () => {

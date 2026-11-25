@@ -1,6 +1,20 @@
-export function isAudioMuted(peerOptions, userDefaults) {
-  const mute = peerOptions?.["disable-audio"] ?? userDefaults.disable_audio;
-  return mute === true || mute === "Y";
+// Session commands predate the corresponding keys in Display Settings.
+const defaultKeys = {
+  "view-only": "view_only",
+  "show-my-cursor": "show_my_cursor",
+  "show-remote-cursor": "show_remote_cursor",
+  "follow-remote-cursor": "follow_remote_cursor",
+  "follow-remote-window": "follow_remote_window",
+  "show-quality-monitor": "show_quality_monitor",
+  "disable-audio": "disable_audio",
+  "disable-clipboard": "disable_clipboard",
+  "lock-after-session-end": "lock_after_session_end",
+  "privacy-mode": "privacy_mode",
+};
+
+export function sessionToggle(peerOptions, userDefaults, name) {
+  const value = peerOptions?.[name] ?? userDefaults[defaultKeys[name] ?? name];
+  return value === true || value === "true" || value === "Y";
 }
 
 // The native client sends the quality percentage in the high byte and

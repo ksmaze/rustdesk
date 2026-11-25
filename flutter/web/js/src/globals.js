@@ -60,6 +60,10 @@ if (YUVCanvas.WebGLFrameSink.isAvailable()) {
 }
 let testSpeed = [0, 0];
 
+export function supportsFullChroma() {
+  return !!yuvCanvas;
+}
+
 export function draw(display, frame) {
   if (yuvWorker) {
     // frame's (y/u/v).bytes already detached, can not transferrable any more.
@@ -264,6 +268,9 @@ window.setByName = (name, value) => {
         case 'up':
           mask = 2;
           break;
+        case 'trackpad':
+          mask = 4;
+          break;
         case 'wheel':
           mask = 3;
           break;
@@ -295,7 +302,6 @@ window.setByName = (name, value) => {
       break;
     case 'option:local':
     case 'option:flutter:local':
-    case 'option:flutter:peer':
       value = JSON.parse(value);
       localStorage.setItem(name + ':' + value.name, value.value);
       break;
@@ -342,7 +348,8 @@ window.setByName = (name, value) => {
       queryOnlines(value);
       break;
     case 'change_prefer_codec':
-      curConn.changePreferCodec(value);
+      curConn.changePreferCodec();
+      break;
     case 'cursor':
       setCustomCursor(value);
       break;
@@ -406,7 +413,6 @@ function _getByName(name, arg) {
       return JSON.stringify(obj);
     case 'option:local':
     case 'option:flutter:local':
-    case 'option:flutter:peer':
       return localStorage.getItem(name + ':' + arg);
     case 'image_quality':
       return curConn.getImageQuality();
@@ -663,7 +669,9 @@ export function getUserDefaultOption(value) {
   };
   try {
     const userDefaultOptions = JSON.parse(localStorage.getItem('user-default-options')) || {};
-    return userDefaultOptions[value] || defaultOptions[value] || '';
+    const option = userDefaultOptions[value] || defaultOptions[value] || '';
+    if (value === 'codec-preference' && option !== 'vp9') return 'auto';
+    return option;
   }
   catch (e) {
     console.error('Failed to get user default options: ' + e.message);
@@ -688,6 +696,10 @@ function setPeerOption(param) {
     const id = obj.id;
     const name = obj.name;
     const value = obj.value;
+    if (window.curConn?._id === id && window.curConn._options) {
+      window.curConn.setOption(name, value);
+      return;
+    }
     const peers = getPeers();
     const options = peers[id] || {};
 
@@ -713,6 +725,7 @@ function getRecentPeers() {
     if (!id) continue;
     const tm = value['tm'];
     const info = value['info'];
+    if (!info) continue;
     const cardInfo = {
       id: id,
       username: info['username'] || '',
@@ -756,7 +769,7 @@ function sessionAdd(value) {
   try {
     const data = JSON.parse(value);
     window.curConn?.close();
-    const conn = new Connection();
+    const conn = new Connection(data.id);
     setConn(conn);
     return '';
   } catch (e) {
@@ -819,7 +832,7 @@ function increasePort(host, offset) {
 
 function getAlternativeCodecs() {
   return JSON.stringify({
-    vp8: true,
+    vp8: false,
     av1: false,
     h264: false,
     h265: false,
