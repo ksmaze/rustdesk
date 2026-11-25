@@ -222,6 +222,11 @@ window.setByName = (name, value) => {
     case 'image_quality':
       curConn.setImageQuality(value);
       break;
+    case 'custom_image_quality':
+    case 'custom-fps':
+      curConn.setOption(name, String(value));
+      curConn.setImageQuality('custom');
+      break;
     case 'lock_screen':
       curConn.lockScreen();
       break;
@@ -231,6 +236,7 @@ window.setByName = (name, value) => {
     case 'switch_display':
       curConn.switchDisplay(value);
       break;
+    case 'remove_peer':
     case 'remove':
       const peers = getPeers();
       delete peers[value];

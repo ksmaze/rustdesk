@@ -420,15 +420,11 @@ class RustdeskImpl {
   }
 
   Future<Int32List?> sessionGetCustomImageQuality(
-      {required UuidValue sessionId, dynamic hint}) {
-    try {
-      return Future(() => Int32List.fromList([
-            int.parse(js.context.callMethod(
-                'getByName', ['option:session', 'custom_image_quality']))
-          ]));
-    } catch (e) {
-      return Future.value(null);
-    }
+      {required UuidValue sessionId, dynamic hint}) async {
+    final quality = double.tryParse(js.context.callMethod(
+        'getByName', ['option:session', 'custom_image_quality']));
+    if (quality == null || !quality.isFinite) return null;
+    return Int32List.fromList([quality.toInt()]);
   }
 
   bool sessionIsKeyboardModeSupported(

@@ -736,7 +736,10 @@ class _RemotePageState extends State<RemotePage>
         children: [
           Container(
               color: kColorCanvas,
-              child: RawKeyFocusScope(
+              // Keep the web keyboard handler out of the focus tree during login.
+              child: isWeb && _ffi.ffiModel.pi.isSet.isFalse
+                  ? getBodyForDesktop(context)
+                  : RawKeyFocusScope(
                   focusNode: _rawKeyFocusNode,
                   onFocusChange: (bool imageFocused) {
                     debugPrint(
@@ -949,7 +952,9 @@ class _RemotePageState extends State<RemotePage>
           stateGlobal.getInputSource(force: true);
           _syncMacOSKeyboardGrab(
               reassert: !isInputSourceFlutter, allowInactiveLifecycle: true);
-        } else if (!_rawKeyFocusNode.hasFocus) {
+        } else if (isWeb
+            ? !_rawKeyFocusNode.hasPrimaryFocus
+            : !_rawKeyFocusNode.hasFocus) {
           _rawKeyFocusNode.requestFocus();
         }
       },

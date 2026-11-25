@@ -6,6 +6,7 @@ import * as sha256 from "fast-sha256";
 import * as globals from "./globals";
 import * as consts from "./consts";
 import { decompress, mapKey, sleep } from "./common";
+import { customVideoOptions, isAudioMuted } from "./session_preferences.js";
 
 export const PORT = 21116;
 const HOSTS = [
@@ -734,10 +735,14 @@ export default class Connection {
   getOptionMessage(): message.OptionMessage | undefined {
     let n = 0;
     const msg = message.OptionMessage.fromPartial({});
-    const q = this.getImageQualityEnum(this.getImageQuality(), true);
+    const quality = this.getImageQuality();
+    const q = this.getImageQualityEnum(quality, true);
     const yes = message.OptionMessage_BoolOption.Yes;
     if (q != undefined) {
       msg.image_quality = q;
+      n += 1;
+    } else if (quality === "custom") {
+      Object.assign(msg, this.customVideoOptions());
       n += 1;
     }
     if (this._options["show-remote-cursor"]) {
@@ -752,7 +757,7 @@ export default class Connection {
       msg.privacy_mode = yes;
       n += 1;
     }
-    if (this._options["disable-audio"]) {
+    if (this.getToggleOption("disable-audio")) {
       msg.disable_audio = yes;
       n += 1;
     }
@@ -906,6 +911,9 @@ export default class Connection {
   }
 
   getToggleOption(name: string): Boolean {
+    if (name === "disable-audio") {
+      return isAudioMuted(this._options, globals.getJsonObj("user-default-options"));
+    }
     // TODO: more default settings
     const defaultToggleTrue = [
       'show-remote-cursor',
@@ -1168,7 +1176,7 @@ export default class Connection {
     //     return None;
     // }
 
-    const v = !this._options[name];
+    const v = name === "disable-audio" ? !this.getToggleOption(name) : !this._options[name];
     const option = message.OptionMessage.fromPartial({});
     const v2 = v
       ? message.OptionMessage_BoolOption.Yes
@@ -1248,7 +1256,12 @@ export default class Connection {
   }
 
   getImageQuality() {
-    return this.getOption("image-quality");
+    return this._options?.["image-quality"] ?? globals.getUserDefaultOption("image_quality");
+  }
+
+  private customVideoOptions() {
+    const allowMore = !!localStorage.getItem("custom-rendezvous-server") || isDirectAddress(this._id);
+    return customVideoOptions(this.getOption("custom_image_quality"), this.getOption("custom-fps"), allowMore);
   }
 
   getImageQualityEnum(
@@ -1270,8 +1283,10 @@ export default class Connection {
   setImageQuality(value: string) {
     this.setOption("image-quality", value);
     const image_quality = this.getImageQualityEnum(value, false);
-    if (image_quality == undefined) return;
-    const option = message.OptionMessage.fromPartial({ image_quality });
+    if (image_quality == undefined && value !== "custom") return;
+    const option = message.OptionMessage.fromPartial(
+      value === "custom" ? this.customVideoOptions() : { image_quality }
+    );
     const misc = message.Misc.fromPartial({ option });
     this._ws?.sendMessage({ misc });
   }
