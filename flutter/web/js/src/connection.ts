@@ -960,13 +960,14 @@ export default class Connection {
   }
 
   setOption(name: string, value: any) {
+    const peers = globals.getPeers();
+    this._options = peers[this._id] ?? {};
     if (value == undefined) {
       delete this._options[name];
     } else {
       this._options[name] = value;
     }
     this._options["tm"] = new Date().getTime();
-    const peers = globals.getPeers();
     peers[this._id] = this._options;
     localStorage.setItem("peers", JSON.stringify(peers));
   }

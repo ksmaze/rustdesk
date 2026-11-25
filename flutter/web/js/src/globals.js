@@ -533,6 +533,7 @@ window.reloadShortcuts = (json) => {
 }
 
 window.init = async () => {
+  migratePeerFlutterOptions();
   if (yuvWorker) {
     yuvWorker.onmessage = (e) => {
       onRgba(e.data.display, e.data.frame);
@@ -551,6 +552,25 @@ window.init = async () => {
 
 export function getPeers() {
   return getJsonObj('peers');
+}
+
+function migratePeerFlutterOptions() {
+  const prefix = 'option:flutter:peer:';
+  const keys = Object.keys(localStorage).filter(key => key.startsWith(prefix));
+  if (!keys.length) return;
+  try {
+    // Before per-peer storage, all existing peers shared these canvas settings.
+    const peers = JSON.parse(localStorage.getItem('peers') || '{}');
+    for (const key of keys) {
+      const name = 'flutter:' + key.slice(prefix.length);
+      const value = localStorage.getItem(key);
+      for (const options of Object.values(peers)) options[name] ??= value;
+    }
+    localStorage.setItem('peers', JSON.stringify(peers));
+    for (const key of keys) localStorage.removeItem(key);
+  } catch (e) {
+    console.warn('Could not migrate saved web peer settings', e);
+  }
 }
 
 export function getJsonObj(key) {
