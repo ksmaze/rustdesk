@@ -875,6 +875,7 @@ export default class Connection {
       switch (notification.privacy_mode_state) {
         case state.PrvOnByOther:
           this.msgbox("error", "Connecting...", "Someone turns on privacy mode, exit");
+          this.close();
           return false;
         case state.PrvOffFailed:
           this.msgbox("custom-error", "Privacy mode", notification.details || "Failed to turn off");
@@ -888,7 +889,9 @@ export default class Connection {
         case state.PrvOnFailedPlugin:
         case state.PrvNotSupported:
           this._privacyActive = notification.privacy_mode_state === state.PrvOnSucceeded;
-          this.setOption("privacy-mode", this._privacyActive);
+          if (this._privacyActive !== sessionToggle(this._options, this._defaults, "privacy-mode")) {
+            this.setOption("privacy-mode", this._privacyActive);
+          }
           if (this._privacyActive) {
             this.setOption("privacy-mode-impl-key", notification.impl_key || "privacy_mode_impl_mag");
           } else if (notification.privacy_mode_state !== state.PrvOffSucceeded) {
@@ -917,6 +920,9 @@ export default class Connection {
           break;
         case message.PermissionInfo_Permission.Audio:
           name = "audio";
+          break;
+        case message.PermissionInfo_Permission.PrivacyMode:
+          name = "privacy_mode";
           break;
         default:
           return;
