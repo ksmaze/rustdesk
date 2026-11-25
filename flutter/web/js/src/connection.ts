@@ -6,6 +6,7 @@ import * as sha256 from "fast-sha256";
 import * as globals from "./globals";
 import * as consts from "./consts";
 import { decompress, mapKey, sleep } from "./common";
+import { customVideoOptions, sessionToggle } from "./session_preferences.js";
 
 export const PORT = 21116;
 const HOSTS = [
@@ -18,6 +19,10 @@ const SCHEMA = "ws://";
 
 type MsgboxCallback = (type: string, title: string, text: string, link: string) => void;
 type DrawCallback = (display: number, data: Uint8Array) => void;
+const SWAPPED_MODIFIERS: Record<string, string> = {
+  ControlLeft: "MetaLeft", MetaLeft: "ControlLeft",
+  ControlRight: "MetaRight", MetaRight: "ControlRight",
+};
 //const cursorCanvas = document.createElement("canvas");
 
 // USB HID usage code -> internal key name (from production rustdesk web client)
@@ -165,6 +170,8 @@ export default class Connection {
   _pairing: SealDeskPairing | undefined;
   _tailcatAddress: string | undefined;
   _options: any;
+  private readonly _defaults = globals.getJsonObj("user-default-options");
+  private _privacyActive = false;
   _videoTestSpeed: number[];
   _cursors: Map<string, message.CursorData>;
   _qualityTimer: any;
@@ -172,11 +179,12 @@ export default class Connection {
   _frameCounts: Map<number, number>;
   _codecFormat: string;
 
-  constructor() {
+  constructor(id?: string) {
     this._msgbox = globals.msgbox;
     this._draw = globals.draw;
     this._msgs = [];
-    this._id = "";
+    this._id = id ?? "";
+    if (id) this._options = globals.getPeers()[id] || {};
     this._videoTestSpeed = [0, 0];
     this._cursors = new Map();
     this._qualityTick = 0;
@@ -197,6 +205,7 @@ export default class Connection {
   }
 
   async _start(id: string) {
+    this._privacyActive = false;
     if (!this._options) {
       this._options = globals.getPeers()[id] || {};
     }
@@ -439,12 +448,12 @@ export default class Connection {
       fps[display] = Math.round((n * 1000) / elapsed);
       this._frameCounts.set(display, 0);
     });
+    const format = this._videoDecoder?.frameBuffer?.format;
     globals.pushEvent("update_quality_status", {
       speed: ((bytes * 1000) / elapsed / 1024).toFixed(2) + "kB/s",
       fps: JSON.stringify(fps),
       codec_format: this._codecFormat,
-      // The web client never advertises i444 decoding, so the peer always sends 4:2:0.
-      chroma: this._codecFormat ? "4:2:0" : "",
+      chroma: format ? (format.chromaWidth === format.width && format.chromaHeight === format.height ? "4:4:4" : "4:2:0") : "",
     });
   }
 
@@ -481,6 +490,7 @@ export default class Connection {
       } else if (msg?.video_frame) {
         this.handleVideoFrame(msg?.video_frame!);
       } else if (msg?.clipboard) {
+        if (this.getToggleOption("disable-clipboard") || this.getToggleOption("view-only")) continue;
         const cb = msg?.clipboard;
         if (cb.compress) {
           const c = await decompress(cb.content);
@@ -534,7 +544,7 @@ export default class Connection {
       } else if (msg?.misc) {
         if (!this.handleMisc(msg?.misc)) break;
       } else if (msg?.audio_frame) {
-        globals.playAudio(msg?.audio_frame.data);
+        if (!this.getToggleOption("disable-audio")) globals.playAudio(msg.audio_frame.data);
       }
     }
   }
@@ -699,11 +709,19 @@ export default class Connection {
     }
   }
 
-  changePreferCodec() {
-    const supported_decoding = message.SupportedDecoding.fromPartial({
+  private supportedDecoding() {
+    const i444 = globals.supportsFullChroma();
+    return message.SupportedDecoding.fromPartial({
       ability_vp9: 1,
-      ability_h264: 1,
+      prefer: this.getOption("codec-preference") === "vp9"
+        ? message.SupportedDecoding_PreferCodec.VP9 : message.SupportedDecoding_PreferCodec.Auto,
+      i444: { vp9: i444 },
+      prefer_chroma: i444 && this.getToggleOption("i444") ? message.Chroma.I444 : message.Chroma.I420,
     });
+  }
+
+  changePreferCodec() {
+    const supported_decoding = this.supportedDecoding();
     const option = message.OptionMessage.fromPartial({ supported_decoding });
     const misc = message.Misc.fromPartial({ option });
     this._ws?.sendMessage({ misc });
@@ -732,35 +750,29 @@ export default class Connection {
   }
 
   getOptionMessage(): message.OptionMessage | undefined {
-    let n = 0;
-    const msg = message.OptionMessage.fromPartial({});
-    const q = this.getImageQualityEnum(this.getImageQuality(), true);
+    const msg = message.OptionMessage.fromPartial({ supported_decoding: this.supportedDecoding() });
+    const quality = this.getImageQuality();
+    const q = this.getImageQualityEnum(quality, true);
     const yes = message.OptionMessage_BoolOption.Yes;
     if (q != undefined) {
       msg.image_quality = q;
-      n += 1;
+    } else if (quality === "custom") {
+      Object.assign(msg, this.customVideoOptions());
     }
-    if (this._options["show-remote-cursor"]) {
-      msg.show_remote_cursor = yes;
-      n += 1;
+    const viewOnly = this.getToggleOption("view-only");
+    if (viewOnly) {
+      msg.disable_keyboard = yes;
+      msg.enable_file_transfer = message.OptionMessage_BoolOption.No;
+      if (this.getToggleOption("show-my-cursor")) msg.show_my_cursor = yes;
     }
-    if (this._options["lock-after-session-end"]) {
-      msg.lock_after_session_end = yes;
-      n += 1;
-    }
-    if (this._options["privacy-mode"]) {
-      msg.privacy_mode = yes;
-      n += 1;
-    }
-    if (this._options["disable-audio"]) {
-      msg.disable_audio = yes;
-      n += 1;
-    }
-    if (this._options["disable-clipboard"]) {
-      msg.disable_clipboard = yes;
-      n += 1;
-    }
-    return n > 0 ? msg : undefined;
+    if (viewOnly || this.getToggleOption("show-remote-cursor")) msg.show_remote_cursor = yes;
+    if (viewOnly || this.getToggleOption("disable-clipboard")) msg.disable_clipboard = yes;
+    if (this.getToggleOption("follow-remote-cursor")) msg.follow_remote_cursor = yes;
+    if (this.getToggleOption("follow-remote-window")) msg.follow_remote_window = yes;
+    if (!viewOnly && this.getToggleOption("lock-after-session-end")) msg.lock_after_session_end = yes;
+    if (sessionToggle(this._options, this._defaults, "privacy-mode")) msg.privacy_mode = yes;
+    if (this.getToggleOption("disable-audio")) msg.disable_audio = yes;
+    return msg;
   }
 
   sendVideoReceived() {
@@ -847,8 +859,8 @@ export default class Connection {
   }
 
   shouldAutoLogin(): string {
-    const l = this.getOption("lock-after-session-end");
-    const a = !!this.getOption("auto-login");
+    const l = !this.getToggleOption("view-only") && this.getToggleOption("lock-after-session-end");
+    const a = this.getToggleOption("auto-login");
     const p = this.getOption("os-password");
     if (p && l && a) {
       return p;
@@ -857,7 +869,38 @@ export default class Connection {
   }
 
   handleMisc(misc: message.Misc) {
-    if (misc.audio_format) {
+    if (misc.back_notification?.privacy_mode_state != null) {
+      const notification = misc.back_notification;
+      const state = message.BackNotification_PrivacyModeState;
+      switch (notification.privacy_mode_state) {
+        case state.PrvOnByOther:
+          this.msgbox("error", "Connecting...", "Someone turns on privacy mode, exit");
+          this.close();
+          return false;
+        case state.PrvOffFailed:
+          this.msgbox("custom-error", "Privacy mode", notification.details || "Failed to turn off");
+          break;
+        case state.PrvOnSucceeded:
+        case state.PrvOffSucceeded:
+        case state.PrvOffByPeer:
+        case state.PrvOffUnknown:
+        case state.PrvOnFailed:
+        case state.PrvOnFailedDenied:
+        case state.PrvOnFailedPlugin:
+        case state.PrvNotSupported:
+          this._privacyActive = notification.privacy_mode_state === state.PrvOnSucceeded;
+          if (this._privacyActive !== sessionToggle(this._options, this._defaults, "privacy-mode")) {
+            this.setOption("privacy-mode", this._privacyActive);
+          }
+          if (this._privacyActive) {
+            this.setOption("privacy-mode-impl-key", notification.impl_key || "privacy_mode_impl_mag");
+          } else if (notification.privacy_mode_state !== state.PrvOffSucceeded) {
+            this.msgbox("custom-error", "Privacy mode", notification.details || "Privacy mode is off");
+          }
+          globals.pushEvent("update_privacy_mode", {});
+          break;
+      }
+    } else if (misc.audio_format) {
       globals.initAudio(
         misc.audio_format.channels,
         misc.audio_format.sample_rate
@@ -877,6 +920,9 @@ export default class Connection {
           break;
         case message.PermissionInfo_Permission.Audio:
           name = "audio";
+          break;
+        case message.PermissionInfo_Permission.PrivacyMode:
+          name = "privacy_mode";
           break;
         default:
           return;
@@ -902,18 +948,12 @@ export default class Connection {
   }
 
   getOption(name: string): any {
-    return this._options[name] ?? globals.getUserDefaultOption(name);
+    return this._options?.[name] ?? globals.getUserDefaultOption(name);
   }
 
-  getToggleOption(name: string): Boolean {
-    // TODO: more default settings
-    const defaultToggleTrue = [
-      'show-remote-cursor',
-      'privacy-mode',
-      'enable-file-copy-paste',
-      'allow_swap_key',
-    ];
-    return this._options[name] || (defaultToggleTrue.includes(name) ? true : false);
+  getToggleOption(name: string): boolean {
+    if (name === "privacy-mode") return this._privacyActive;
+    return sessionToggle(this._options, this._defaults, name);
   }
 
   // TODO:
@@ -926,13 +966,14 @@ export default class Connection {
   }
 
   setOption(name: string, value: any) {
+    const peers = globals.getPeers();
+    this._options = peers[this._id] ?? {};
     if (value == undefined) {
       delete this._options[name];
     } else {
       this._options[name] = value;
     }
     this._options["tm"] = new Date().getTime();
-    const peers = globals.getPeers();
     peers[this._id] = this._options;
     localStorage.setItem("peers", JSON.stringify(peers));
   }
@@ -959,6 +1000,15 @@ export default class Connection {
     }
     if (command && (name == "Meta" || name == "RWin")) {
       command = false;
+    }
+    if (this.getToggleOption("allow_swap_key") && key_event.control_key != null) {
+      const key = message.ControlKey;
+      switch (key_event.control_key) {
+        case key.Control: key_event.control_key = key.Meta; break;
+        case key.Meta: key_event.control_key = key.Control; break;
+        case key.RControl: key_event.control_key = key.RWin; break;
+        case key.RWin: key_event.control_key = key.RControl; break;
+      }
     }
     key_event.down = down;
     key_event.press = press;
@@ -991,6 +1041,7 @@ export default class Connection {
       : platform === "Mac OS" ? MACOS_SCANCODE_MAP
       : platform === "Android" ? ANDROID_SCANCODE_MAP
       : WIN_SCANCODE_MAP;
+    if (this.getToggleOption("allow_swap_key")) keyName = SWAPPED_MODIFIERS[keyName] ?? keyName;
     const code = scancodeMap[keyName];
     if (code == null) {
       console.error("Unknown key name " + keyName + " for platform " + platform);
@@ -1095,6 +1146,7 @@ export default class Connection {
   }
 
   getMod(alt: Boolean, ctrl: Boolean, shift: Boolean, command: Boolean) {
+    if (this.getToggleOption("allow_swap_key")) [ctrl, command] = [command, ctrl];
     const mod: message.ControlKey[] = [];
     if (alt) mod.push(message.ControlKey.Alt);
     if (ctrl) mod.push(message.ControlKey.Control);
@@ -1112,6 +1164,15 @@ export default class Connection {
     shift: Boolean = false,
     command: Boolean = false
   ) {
+    const type = mask & 7;
+    if ((type === 3 || type === 4) && this.getToggleOption("reverse_mouse_wheel")) {
+      x = -x;
+      y = -y;
+    }
+    const buttons = mask >> 3;
+    if ((buttons === 1 || buttons === 2) && this.getToggleOption("swap-left-right-mouse")) {
+      mask = type | ((buttons === 1 ? 2 : 1) << 3);
+    }
     const mouse_event = message.MouseEvent.fromPartial({
       mask,
       x,
@@ -1168,7 +1229,7 @@ export default class Connection {
     //     return None;
     // }
 
-    const v = !this._options[name];
+    const v = !this.getToggleOption(name);
     const option = message.OptionMessage.fromPartial({});
     const v2 = v
       ? message.OptionMessage_BoolOption.Yes
@@ -1176,6 +1237,15 @@ export default class Connection {
     switch (name) {
       case "show-remote-cursor":
         option.show_remote_cursor = v2;
+        break;
+      case "follow-remote-cursor":
+        option.follow_remote_cursor = v2;
+        break;
+      case "follow-remote-window":
+        option.follow_remote_window = v2;
+        break;
+      case "show-my-cursor":
+        option.show_my_cursor = v2;
         break;
       case "disable-audio":
         option.disable_audio = v2;
@@ -1199,8 +1269,9 @@ export default class Connection {
         option.block_input = message.OptionMessage_BoolOption.No;
         break;
       case "show-quality-monitor":
-      case "allow-swap-key":
-        break;
+      case "allow_swap_key":
+        this.setOption(name, v);
+        return;
       case "view-only":
         if (v) {
           option.disable_keyboard = message.OptionMessage_BoolOption.Yes;
@@ -1209,6 +1280,10 @@ export default class Connection {
           option.enable_file_transfer = message.OptionMessage_BoolOption.No;
           option.lock_after_session_end = message.OptionMessage_BoolOption.No;
         } else {
+          if (this.getToggleOption("show-my-cursor")) {
+            this.setOption("show-my-cursor", false);
+            option.show_my_cursor = message.OptionMessage_BoolOption.No;
+          }
           option.disable_keyboard = message.OptionMessage_BoolOption.No;
           option.disable_clipboard = this.getToggleOption("disable-clipboard")
             ? message.OptionMessage_BoolOption.Yes
@@ -1225,10 +1300,10 @@ export default class Connection {
         }
         break;
       default:
-        this.setOption(name, this._options[name] ? undefined : "Y");
+        this.setOption(name, v ? "Y" : "");
         return;
     }
-    if (name.indexOf("block-input") < 0) this.setOption(name, v);
+    if (name !== "privacy-mode" && name.indexOf("block-input") < 0) this.setOption(name, v);
     const misc = message.Misc.fromPartial({ option });
     this._ws?.sendMessage({ misc });
   }
@@ -1248,7 +1323,12 @@ export default class Connection {
   }
 
   getImageQuality() {
-    return this.getOption("image-quality");
+    return this._options?.["image-quality"] ?? globals.getUserDefaultOption("image_quality");
+  }
+
+  private customVideoOptions() {
+    const allowMore = !!localStorage.getItem("custom-rendezvous-server") || isDirectAddress(this._id);
+    return customVideoOptions(this.getOption("custom_image_quality"), this.getOption("custom-fps"), allowMore);
   }
 
   getImageQualityEnum(
@@ -1270,8 +1350,10 @@ export default class Connection {
   setImageQuality(value: string) {
     this.setOption("image-quality", value);
     const image_quality = this.getImageQualityEnum(value, false);
-    if (image_quality == undefined) return;
-    const option = message.OptionMessage.fromPartial({ image_quality });
+    if (image_quality == undefined && value !== "custom") return;
+    const option = message.OptionMessage.fromPartial(
+      value === "custom" ? this.customVideoOptions() : { image_quality }
+    );
     const misc = message.Misc.fromPartial({ option });
     this._ws?.sendMessage({ misc });
   }

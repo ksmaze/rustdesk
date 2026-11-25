@@ -92,6 +92,7 @@ RUN cd /app/rustdesk/flutter/web/js && \
     mv src/gen_js_from_hbb.tmp src/gen_js_from_hbb.ts && \
     python ./ts_proto.py && \
     npx tsc && \
+    node --experimental-strip-types --test src/session_preferences.test.ts && \
     npx vite build
 
 # --- Download web dependencies ---

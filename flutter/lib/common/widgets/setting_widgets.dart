@@ -243,11 +243,13 @@ List<(String, String)> otherDefaultSettings() {
         'Use all my displays for the remote session',
         kKeyUseAllMyDisplaysForTheRemoteSession
       ),
-    ('Keep terminal sessions on disconnect', kOptionTerminalPersistent),
-    (
-      'Allow terminal apps to copy to clipboard',
-      kOptionAllowTerminalClipboardWrite
-    ),
+    if (!isWeb)
+      ('Keep terminal sessions on disconnect', kOptionTerminalPersistent),
+    if (!isWeb)
+      (
+        'Allow terminal apps to copy to clipboard',
+        kOptionAllowTerminalClipboardWrite
+      ),
   ];
 
   return v;

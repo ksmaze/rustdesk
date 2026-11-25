@@ -276,8 +276,7 @@ class RustdeskImpl {
 
   Future<String?> sessionGetFlutterOption(
       {required UuidValue sessionId, required String k, dynamic hint}) {
-    return Future(
-        () => js.context.callMethod('getByName', ['option:flutter:peer', k]));
+    return sessionGetOption(sessionId: sessionId, arg: 'flutter:$k');
   }
 
   Future<void> sessionSetFlutterOption(
@@ -285,10 +284,7 @@ class RustdeskImpl {
       required String k,
       required String v,
       dynamic hint}) {
-    return Future(() => js.context.callMethod('setByName', [
-          'option:flutter:peer',
-          jsonEncode({'name': k, 'value': v})
-        ]));
+    return sessionPeerOption(sessionId: sessionId, name: 'flutter:$k', value: v);
   }
 
   int getNextTextureKey({dynamic hint}) {
@@ -373,7 +369,7 @@ class RustdeskImpl {
       {required UuidValue sessionId, dynamic hint}) {
     final mode =
         js.context.callMethod('getByName', ['option:session', 'keyboard_mode']);
-    return Future(() => mode == '' ? null : mode);
+    return Future.value(mode == kKeyMapMode ? kKeyMapMode : kKeyLegacyMode);
   }
 
   Future<void> sessionSetKeyboardMode(
@@ -420,24 +416,16 @@ class RustdeskImpl {
   }
 
   Future<Int32List?> sessionGetCustomImageQuality(
-      {required UuidValue sessionId, dynamic hint}) {
-    try {
-      return Future(() => Int32List.fromList([
-            int.parse(js.context.callMethod(
-                'getByName', ['option:session', 'custom_image_quality']))
-          ]));
-    } catch (e) {
-      return Future.value(null);
-    }
+      {required UuidValue sessionId, dynamic hint}) async {
+    final quality = double.tryParse(js.context.callMethod(
+        'getByName', ['option:session', 'custom_image_quality']));
+    if (quality == null || !quality.isFinite) return null;
+    return Int32List.fromList([quality.toInt()]);
   }
 
   bool sessionIsKeyboardModeSupported(
       {required UuidValue sessionId, required String mode, dynamic hint}) {
-    if (mainGetInputSource(hint: hint) == 'Input source 1') {
-      return [kKeyMapMode, kKeyTranslateMode].contains(mode);
-    } else {
-      return [kKeyLegacyMode, kKeyMapMode].contains(mode);
-    }
+    return [kKeyLegacyMode, kKeyMapMode].contains(mode);
   }
 
   bool sessionIsMultiUiSession({required UuidValue sessionId, dynamic hint}) {
@@ -1017,22 +1005,12 @@ class RustdeskImpl {
   }
 
   String mainGetInputSource({dynamic hint}) {
-    final inputSource =
-        js.context.callMethod('getByName', ['option:local', 'input-source']);
-    // // js grab mode
-    // export const CONFIG_INPUT_SOURCE_1 = "Input source 1";
-    // // flutter grab mode
-    // export const CONFIG_INPUT_SOURCE_2 = "Input source 2";
-    return inputSource != '' ? inputSource : 'Input source 1';
+    // The web client receives session keyboard events through Flutter.
+    return 'Input source 2';
   }
 
   Future<void> mainSetInputSource(
-      {required UuidValue sessionId, required String value, dynamic hint}) {
-    return Future(() => js.context.callMethod('setByName', [
-          'option:local',
-          jsonEncode({'name': 'input-source', 'value': value})
-        ]));
-  }
+      {required UuidValue sessionId, required String value, dynamic hint}) async {}
 
   Future<String> mainGetMyId({dynamic hint}) {
     return Future(() => js.context.callMethod('getByName', ['my_id']));
@@ -1057,7 +1035,7 @@ class RustdeskImpl {
 
   String mainGetPeerFlutterOptionSync(
       {required String id, required String k, dynamic hint}) {
-    return js.context.callMethod('getByName', ['option:flutter:peer', k]);
+    return mainGetPeerOptionSync(id: id, key: 'flutter:$k');
   }
 
   void mainSetPeerFlutterOptionSync(
@@ -1065,10 +1043,7 @@ class RustdeskImpl {
       required String k,
       required String v,
       dynamic hint}) {
-    js.context.callMethod('setByName', [
-      'option:flutter:peer',
-      jsonEncode({'name': k, 'value': v})
-    ]);
+    mainSetPeerOptionSync(id: id, key: 'flutter:$k', value: v);
   }
 
   Future<void> mainSetPeerOption(
@@ -1763,7 +1738,6 @@ class RustdeskImpl {
 
   String mainSupportedInputSource({dynamic hint}) {
     return jsonEncode([
-      ['Input source 1', 'input_source_1_tip'],
       ['Input source 2', 'input_source_2_tip']
     ]);
   }
@@ -2042,8 +2016,10 @@ class RustdeskImpl {
 
   Future<void> sessionSetEdgeScrollEdgeThickness(
       {required UuidValue sessionId, required int value, dynamic hint}) {
-    return Future(() => js.context.callMethod('setByName',
-        ['option:session', 'edge-scroll-edge-thickness', value.toString()]));
+    return sessionPeerOption(
+        sessionId: sessionId,
+        name: kOptionEdgeScrollEdgeThickness,
+        value: value.toString());
   }
 
   String sessionGetConnSessionId({required UuidValue sessionId, dynamic hint}) {

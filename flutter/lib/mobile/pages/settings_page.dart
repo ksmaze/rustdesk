@@ -1260,9 +1260,9 @@ class __DisplayPageState extends State<_DisplayPage> {
     final h265 = codecsJson['h265'] ?? false;
     var codecList = [
       _RadioEntry('Auto', 'auto'),
-      _RadioEntry('VP8', 'vp8'),
+      if (!isWeb) _RadioEntry('VP8', 'vp8'),
       _RadioEntry('VP9', 'vp9'),
-      _RadioEntry('AV1', 'av1'),
+      if (!isWeb) _RadioEntry('AV1', 'av1'),
       if (h264) _RadioEntry('H264', 'h264'),
       if (h265) _RadioEntry('H265', 'h265')
     ];
